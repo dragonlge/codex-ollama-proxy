@@ -12,6 +12,7 @@ const nativeImageGeneration = require('./native-image-generation');
 const { createOllamaCloudPuller } = require('./ollama-cloud-pull');
 const markers = require('./ui-markers');
 const upstreamLib = require('./upstream');
+const dragonaiBrain = require('./dragonai-brain');
 
 // proxy-models.toml drives per-request model auto-routing.
 // Loaded once at startup; editable without restart by re-running apply script.
@@ -1900,6 +1901,14 @@ function sendSseCompleted(clientRes, response) {
 }
 
 const server = http.createServer((clientReq, clientRes) => {
+  // Brain mode: model discovery comes from the Brain, not the static upstream.
+  if (dragonaiBrain.enabled() && clientReq.method === 'GET') {
+    const cleanPath = clientReq.url.replace(/\?.*$/u, '');
+    if (cleanPath === '/models' || cleanPath === '/v1/models') {
+      dragonaiBrain.modelsProxy(clientRes);
+      return;
+    }
+  }
   const isResponses = clientReq.method === 'POST' && clientReq.url.endsWith('/responses');
   const chunks = [];
   clientReq.on('data', (c) => chunks.push(c));
@@ -1935,6 +1944,23 @@ const server = http.createServer((clientReq, clientRes) => {
       } catch (e) {
         log('request body parse/translate failed: ' + e.message + ' (passing through)');
       }
+    }
+    if (isResponses && body && dragonaiBrain.enabled()) {
+      // Brain mode: the DragonAI Brain owns the whole turn (routing, model
+      // selection, local tools). The proxy only translates the wire protocol;
+      // translateOutputItem restores namespaced/custom tool calls the Brain
+      // hands back for native Codex execution.
+      debugLog('dragonai brain mode: forwarding turn to ' + dragonaiBrain.brainUrl());
+      const brainState = { rewrittenIds: new Set(), customNames: info.customNames };
+      await dragonaiBrain.runBrainTurn({
+        req: clientReq,
+        res: clientRes,
+        body,
+        isStream: originalStream,
+        translateOutputItem: (item) => translateOutputItem(item, brainState),
+        log,
+      });
+      return;
     }
     const upstream = getUpstream();
     if (

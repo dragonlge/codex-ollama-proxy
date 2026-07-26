@@ -329,6 +329,29 @@ Available preset toggles include:
 
 Runtime options such as `--foreground` remain on the `run` or `serve` command rather than being stored in the preset.
 
+## DragonAI Brain Mode
+
+Brain mode hands every `/v1/responses` turn to a DragonAI Brain speaking the
+`dragonai-agent/v1` protocol instead of a static upstream:
+
+```bash
+codex-ollama-proxy serve --brain-url "http://127.0.0.1:8899" [--brain-api-key KEY]
+```
+
+The flags set `DRAGONAI_BRAIN_URL` / `DRAGONAI_BRAIN_API_KEY`; setting the
+environment variables directly works too. While brain mode is on:
+
+- Each turn is translated to a `CODEX_MODEL_REQUEST` and POSTed to
+  `<brain-url>/agent/v1/turn`; the Brain's streamed events are translated back
+  into the Codex Responses SSE lifecycle (text deltas, `function_call` items
+  with preserved `call_id`, terminal `response.completed`).
+- `GET /v1/models` is forwarded to the Brain.
+- No adaptor process is started; the configured upstream is not contacted.
+
+The proxy stays a pure wire-protocol adapter: all routing, model selection,
+and tool policy live in the Brain. When `DRAGONAI_BRAIN_URL` is unset, the
+proxy behaves exactly as before.
+
 ## What the Proxy Fixes
 
 Codex can send plugins and MCP tools using OpenAI-specific namespace, dynamic-tool, managed-tool, and freeform-tool formats.

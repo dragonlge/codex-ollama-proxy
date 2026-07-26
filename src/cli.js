@@ -30,6 +30,7 @@ function usage() {
   codex-ollama-proxy serve [--adaptor chat-completion|google] [--dedupe-large-input|--no-dedupe-large-input] [--dedupe-min-chars N]
   codex-ollama-proxy serve --preset NAME [--api-key KEY] [--replace]
   codex-ollama-proxy serve --adaptor chat-completion|google [--completion-model MODEL] [--adaptor-port PORT]
+  codex-ollama-proxy serve --brain-url URL [--brain-api-key KEY]
   codex-ollama-proxy preset add NAME [--provider PROVIDER] [--adaptor chat-completion|google|none] [--url URL] --models MODEL[,MODEL...] [--default-model MODEL] [--image-model MODEL] [--api-key KEY]
   codex-ollama-proxy preset add NAME --provider vertexai --project PROJECT --location LOCATION --models MODEL[,MODEL...] [--vertex-token TOKEN]
     [--auto-image|--no-auto-image] [--dedupe-large-input|--no-dedupe-large-input] [--dedupe-min-chars N]
@@ -618,10 +619,17 @@ async function serveCmd(flags = {}) {
   if (flags.dedupeLargeInput) process.env.PROXY_DEDUPE_LARGE_INPUT = '1';
   if (flags.noDedupeLargeInput) process.env.PROXY_DEDUPE_LARGE_INPUT = '0';
   if (flags.dedupeMinChars !== undefined) process.env.PROXY_DEDUPE_MIN_CHARS = String(flags.dedupeMinChars);
+  // DragonAI brain mode: env-driven, read by the proxy per request, so it must
+  // be set before the proxy is required below. Brain mode needs no adaptor
+  // process (the Brain speaks dragonai-agent/v1 directly), so it goes through
+  // the "none" branch.
+  if (flags.brainUrl) process.env.DRAGONAI_BRAIN_URL = String(flags.brainUrl);
+  if (flags.brainApiKey) process.env.DRAGONAI_BRAIN_API_KEY = String(flags.brainApiKey);
   if (flags.preset) {
     const preset = applyPreset(flags.preset, flags);
     flags = Object.assign({}, flags, { adaptor: preset.adaptor });
   }
+  if (flags.brainUrl) flags = Object.assign({}, flags, { adaptor: 'none' });
   if (!process.env.PROXY_PORT) process.env.PROXY_PORT = PROXY_PORT;
   const proxyPort = parseProxyPort(process.env.PROXY_PORT || PROXY_PORT);
   const runtimeOverrides = launcherRuntimeOverrides(proxyPort);
