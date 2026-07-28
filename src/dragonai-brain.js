@@ -80,9 +80,38 @@ function firstUserText(body) {
 // Stable per-session id: the Responses wire protocol carries no session id, so
 // derive one from the parts that stay constant across turns of one Codex
 // session (see the dragonai-agent/v1 spec).
-function conversationId(body) {
+function headerValue(headers, name) {
+  if (!headers) return '';
+  const wanted = name.toLowerCase();
+  if (typeof headers.get === 'function') return String(headers.get(name) || '');
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === wanted) return Array.isArray(value) ? String(value[0] || '') : String(value || '');
+  }
+  return '';
+}
+
+function transcriptHash(body) {
+  const value = JSON.stringify((body && body.input) || []);
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function codexTurnMetadata(headers) {
+  const raw = headerValue(headers, 'x-codex-turn-metadata');
+  if (!raw || raw.length > 128 * 1024) return {};
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function conversationId(body, metadata = {}) {
+  const explicit = metadata.conversation_id || metadata.thread_id || '';
+  if (explicit) return String(explicit);
   const instructions = body && body.instructions ? String(body.instructions) : '';
-  return crypto.createHash('sha256').update(instructions + firstUserText(body)).digest('hex').slice(0, 16);
+  const anchor = instructions + '\0' + firstUserText(body);
+  return 'codex-' + crypto.createHash('sha256').update(anchor).digest('hex').slice(0, 24);
 }
 
 // Responses request (already run through proxy.js translateRequestBody: flat
@@ -94,11 +123,49 @@ function buildModelRequest(body, opts = {}) {
   // Instructions travel in payload.instructions; strip them from the message
   // conversion so they are not duplicated as a system message.
   const withoutInstructions = Object.assign({}, src, { instructions: undefined });
+  const headers = opts.headers || {};
+  const native = codexTurnMetadata(headers);
+  const nativeThreadId = headerValue(headers, 'thread-id')
+    || headerValue(headers, 'x-client-request-id')
+    || String(native.thread_id || '');
+  const explicitConversation = nativeThreadId
+    || headerValue(headers, 'x-dragonai-conversation-id')
+    || headerValue(headers, 'x-codex-thread-id');
+  const backendSessionId = headerValue(headers, 'session-id')
+    || String(native.session_id || '')
+    || headerValue(headers, 'x-dragonai-backend-session-id');
+  const nativeTurnId = String(native.turn_id || '');
+  const taskId = nativeTurnId
+    || headerValue(headers, 'x-dragonai-task-id')
+    || backendSessionId;
+  const forkedFrom = String(native.forked_from_thread_id || '');
+  const parentConversationId = forkedFrom
+    || headerValue(headers, 'x-codex-parent-thread-id')
+    || String(native.parent_thread_id || '')
+    || headerValue(headers, 'x-dragonai-parent-conversation-id');
+  const subagent = headerValue(headers, 'x-openai-subagent')
+    || String(native.subagent_kind || native.subagent || '');
+  const operation = forkedFrom
+    ? 'fork'
+    : (subagent === 'compact'
+      ? 'compact'
+      : (headerValue(headers, 'x-dragonai-conversation-operation') || 'continue'));
+  const metadata = {
+    backend: headerValue(headers, 'x-dragonai-backend') || 'codex',
+    backend_session_id: backendSessionId,
+    task_id: taskId,
+    thread_id: nativeThreadId || headerValue(headers, 'x-codex-thread-id'),
+    parent_conversation_id: parentConversationId,
+    operation,
+    route_preference: headerValue(headers, 'x-dragonai-route-preference'),
+    capability: headerValue(headers, 'x-dragonai-capability'),
+    transcript_hash: transcriptHash(src),
+  };
   return {
     protocol: PROTOCOL,
     event: 'CODEX_MODEL_REQUEST',
     turn_id: opts.turnId || 't-' + crypto.randomBytes(4).toString('hex'),
-    conversation_id: conversationId(src),
+    conversation_id: conversationId(src, { conversation_id: explicitConversation }),
     payload: {
       model_hint: src.model || 'dragonai/auto',
       instructions: src.instructions ? String(src.instructions) : '',
@@ -106,7 +173,7 @@ function buildModelRequest(body, opts = {}) {
       tools: responsesToolsToChatTools(src.tools),
       tool_choice: src.tool_choice || 'auto',
       stream,
-      metadata: { backend: 'codex', headers: {} },
+      metadata,
     },
   };
 }
@@ -199,6 +266,14 @@ function toolResultMarkerText(data) {
   const duration = Number.isFinite(Number(data.duration_ms)) ? ' (' + Number(data.duration_ms) + 'ms)' : '';
   const failed = data.status === 'failed' ? ' failed' : '';
   return 'dragonai tool: ' + data.tool + failed + duration;
+}
+
+function evidenceMarkerText(data) {
+  if (!data || typeof data !== 'object' || !data.artifact_ref) return '';
+  const count = Number(data.evidence_count) || 0;
+  const summary = data.summary ? truncate(String(data.summary).replace(/\s+/gu, ' '), 900) : '';
+  const path = data.artifact_path ? ', ' + String(data.artifact_path) : '';
+  return 'DragonAI verified evidence (' + count + ', ' + data.artifact_ref + path + ')' + (summary ? '\n' + summary : '');
 }
 
 // Translate the Brain's streamed turn events into a Codex Responses SSE
@@ -339,6 +414,8 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
       try { emitTextMarker(planMarkerText(data)); } catch {}
     } else if (type === 'TOOL_RESULT') {
       try { emitTextMarker(toolResultMarkerText(data)); } catch {}
+    } else if (type === 'EVIDENCE_SUMMARY') {
+      try { emitTextMarker(evidenceMarkerText(data)); } catch {}
     } else if (type === 'MODEL_RESULT') {
       handleResult(data);
     }
@@ -417,7 +494,10 @@ function respondJsonResult(res, envelope, body, translateOutputItem) {
 async function runBrainTurn({ req, res, body, isStream, translateOutputItem, log } = {}) {
   const logFn = typeof log === 'function' ? log : () => {};
   try {
-    const envelope = buildModelRequest(body || {}, { stream: Boolean(isStream) });
+    const envelope = buildModelRequest(body || {}, {
+      stream: Boolean(isStream),
+      headers: req && req.headers ? req.headers : {},
+    });
     const headers = { 'content-type': 'application/json' };
     if (brainApiKey()) headers.authorization = 'Bearer ' + brainApiKey();
     if (isStream) headers.accept = 'text/event-stream';
@@ -488,6 +568,8 @@ module.exports = {
   brainUrl,
   enabled,
   conversationId,
+  transcriptHash,
+  codexTurnMetadata,
   buildModelRequest,
   runBrainTurn,
   modelsProxy,

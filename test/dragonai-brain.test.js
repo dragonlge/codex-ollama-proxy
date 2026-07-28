@@ -64,6 +64,56 @@ function postStream(port, body) {
   });
 }
 
+test('brain envelope preserves stable conversation, task, and fork lineage headers', () => {
+  const body = {
+    instructions: 'You are Codex.',
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue the fix' }] }],
+  };
+  const envelope = brain.buildModelRequest(body, {
+    headers: {
+      'x-dragonai-conversation-id': 'codex-thread-abc123',
+      'x-dragonai-backend-session-id': 'backend-7',
+      'x-dragonai-task-id': 'task-9',
+      'x-dragonai-parent-conversation-id': 'codex-thread-parent',
+      'x-dragonai-conversation-operation': 'fork',
+    },
+  });
+  assert.equal(envelope.conversation_id, 'codex-thread-abc123');
+  assert.equal(envelope.payload.metadata.backend_session_id, 'backend-7');
+  assert.equal(envelope.payload.metadata.task_id, 'task-9');
+  assert.equal(envelope.payload.metadata.parent_conversation_id, 'codex-thread-parent');
+  assert.equal(envelope.payload.metadata.operation, 'fork');
+  assert.match(envelope.payload.metadata.transcript_hash, /^[0-9a-f]{64}$/);
+});
+
+test('Codex native thread and turn metadata are the primary stable identity', () => {
+  const native = {
+    session_id: 'native-session',
+    thread_id: 'native-thread',
+    turn_id: 'native-turn',
+    forked_from_thread_id: 'parent-thread',
+  };
+  const envelope = brain.buildModelRequest(
+    {
+      instructions: 'Compacted instructions may change.',
+      input: [{ type: 'message', role: 'user', content: 'Resume after compact' }],
+    },
+    {
+      headers: {
+        'thread-id': 'native-thread',
+        'session-id': 'native-session',
+        'x-codex-turn-metadata': JSON.stringify(native),
+        'x-dragonai-conversation-id': 'legacy-override',
+      },
+    },
+  );
+  assert.equal(envelope.conversation_id, 'native-thread');
+  assert.equal(envelope.payload.metadata.backend_session_id, 'native-session');
+  assert.equal(envelope.payload.metadata.task_id, 'native-turn');
+  assert.equal(envelope.payload.metadata.parent_conversation_id, 'parent-thread');
+  assert.equal(envelope.payload.metadata.operation, 'fork');
+});
+
 // One compact end-to-end test: a fake DragonAI Brain streams a full
 // dragonai-agent/v1 turn (including observability frames and one unknown
 // event type) and the real proxy request path must translate it into a valid
@@ -86,6 +136,12 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
       writeSse(res, 'MODEL_DELTA', { turn_id: brainRequest.turn_id, text: 'Payment retry ' });
       writeSse(res, 'MODEL_DELTA', { turn_id: brainRequest.turn_id, text: 'bug found.' });
       writeSse(res, 'TOOL_RESULT', { turn_id: brainRequest.turn_id, call_id: 'call_2', tool: 'shell', status: 'completed', duration_ms: 41 });
+      writeSse(res, 'EVIDENCE_SUMMARY', {
+        turn_id: brainRequest.turn_id,
+        artifact_ref: 'sha256:abc123',
+        evidence_count: 1,
+        summary: 'src/PaymentService.java verified at revision deadbeef',
+      });
       writeSse(res, 'TOOL_REQUEST', { turn_id: brainRequest.turn_id, id: 'fc_7', call_id: 'call_7', name: 'apply_patch', arguments: '{"patch":"*** Begin Patch"}' });
       writeSse(res, 'FUTURE_UNKNOWN_EVENT', { turn_id: brainRequest.turn_id, anything: true });
       writeSse(res, 'MODEL_RESULT', {
@@ -162,6 +218,7 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     assert.deepEqual(deltas, ['Payment retry ', 'bug found.']);
     assert.equal(events.filter((e) => e.event === 'response.content_part.added').length, 1);
     assert.equal(events.find((e) => e.event === 'response.output_text.done').data.text, 'Payment retry bug found.');
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('sha256:abc123')));
 
     // TOOL_REQUEST -> function_call item with preserved call_id, exactly once
     // even though MODEL_RESULT repeats it.
@@ -183,7 +240,7 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     assert.equal(brainRequest.protocol, 'dragonai-agent/v1');
     assert.equal(brainRequest.event, 'CODEX_MODEL_REQUEST');
     assert.match(brainRequest.turn_id, /^t-[0-9a-f]+$/);
-    assert.match(brainRequest.conversation_id, /^[0-9a-f]{16}$/);
+    assert.match(brainRequest.conversation_id, /^codex-[0-9a-f]{24}$/);
     assert.equal(brainRequest.payload.model_hint, 'gpt-5.3-codex');
     assert.equal(brainRequest.payload.instructions, 'You are Codex.');
     assert.equal(brainRequest.payload.stream, true);
