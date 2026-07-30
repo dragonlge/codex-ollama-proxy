@@ -273,8 +273,8 @@ function selectedToolsTable(selected) {
   if (!Array.isArray(selected) || !selected.length) return [];
   const lines = [
     '',
-    '| # | Runtime | Selected tool | Why |',
-    '|---:|---|---|---|',
+    '| # | Runtime | Selected tool |',
+    '|---:|---|---|',
   ];
   selected.forEach((item, index) => {
     const friendly = friendlyTool(item);
@@ -284,9 +284,7 @@ function selectedToolsTable(selected) {
     lines.push(
       '| ' + (index + 1) +
       ' | ' + tableCell(runtime) +
-      ' | `' + tableCell(tool) + '`' +
-      ' | ' + tableCell(truncate(item.reason || 'selected by tool profile', 120)) +
-      ' |'
+      ' | `' + tableCell(tool) + '` |'
     );
   });
   return lines;
