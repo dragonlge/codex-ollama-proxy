@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { StringDecoder } = require('string_decoder');
 const markers = require('./ui-markers');
 const {
   responsesInputToChatMessages,
@@ -251,13 +252,104 @@ function truncate(text, max = 300) {
   return s.length > max ? s.slice(0, max) + '…' : s;
 }
 
+function friendlyTool(item) {
+  if (!item || typeof item !== 'object') return '';
+  const name = String(item.name || 'unknown');
+  const source = String(item.source || '');
+  const short = name.split('__').filter(Boolean).at(-1) || name;
+  if (source.startsWith('mcp:')) {
+    return 'MCP ' + source.slice(4) + ':' + short;
+  }
+  if (source === 'codex:collaboration') return 'Codex core:' + short;
+  if (source.startsWith('browser/')) return 'Browser:' + short;
+  return 'Codex:' + short;
+}
+
 function planMarkerText(data) {
   if (!data || typeof data !== 'object') return '';
   const lane = data.lane || '';
   const model = data.model || '';
   if (!lane && !model) return '';
-  const reason = data.reason ? ' (' + data.reason + ')' : '';
-  return 'route: ' + lane + '/' + model + reason;
+  const lines = [];
+  const details = data.neural_route && typeof data.neural_route === 'object'
+    ? data.neural_route : {};
+  const plan = data.turn_plan && typeof data.turn_plan === 'object'
+    ? data.turn_plan : {};
+  const budget = data.context_budget && typeof data.context_budget === 'object'
+    ? data.context_budget : {};
+  const toolProfile = data.tool_profile && typeof data.tool_profile === 'object'
+    ? data.tool_profile : {};
+  const routeBits = [
+    data.category ? 'task=' + data.category : '',
+    details.final_action ? 'action=' + details.final_action : '',
+  ].filter(Boolean);
+  const routePrefix = data.is_continuation ? 'continue' : 'route';
+  lines.push('◇ DragonAI Assistant');
+  if (!data.is_continuation && plan.goal) {
+    lines.push('◆ User goal · ' + truncate(plan.goal, 240));
+  }
+  lines.push(
+    routePrefix + ': ' + lane + '/' + model +
+    (routeBits.length ? ' · ' + routeBits.join(' · ') : '')
+  );
+  if (!data.is_continuation && data.reason) {
+    lines.push('why: ' + truncate(data.reason, 240));
+  }
+  if (details.configured_model && details.actual_model &&
+      details.configured_model !== details.actual_model) {
+    lines.push(
+      'model resolved: ' + details.configured_model + ' → ' +
+      details.actual_model + ' (' +
+      (details.model_resolution || 'provider catalog') + ')'
+    );
+  }
+  if (Array.isArray(plan.evidence_gaps) && plan.evidence_gaps.length) {
+    lines.push(
+      'evidence: ' + plan.evidence_gaps.length + ' gap(s)' +
+      (!data.is_continuation
+        ? ' · ' + truncate(plan.evidence_gaps.join('; '), 280)
+        : '')
+    );
+  }
+  if (Number.isFinite(Number(toolProfile.available_count))) {
+    lines.push(
+      'tools: ' + (toolProfile.selected_count || 0) +
+      '/' + (toolProfile.available_count || 0) + ' selected · ' +
+      (toolProfile.selected_tokens || 0) +
+      '/' + (toolProfile.available_tokens || 0) + 't · profile=' +
+      (toolProfile.profile || 'dynamic')
+    );
+    if (
+      !data.is_continuation &&
+      Array.isArray(toolProfile.selected) &&
+      toolProfile.selected.length
+    ) {
+      lines.push(
+        'selected: ' +
+        truncate(
+          toolProfile.selected.map(friendlyTool).filter(Boolean).join(' · '),
+          520,
+        )
+      );
+    }
+  }
+  if (budget.context_limit) {
+    const before = budget.before || {};
+    const after = budget.after || {};
+    lines.push(
+      'context: ' + (after.total_estimated_tokens || 0) +
+      '/' + budget.input_budget +
+      (Number(before.total_estimated_tokens || 0) !== Number(after.total_estimated_tokens || 0)
+        ? ' · fitted from ' + (before.total_estimated_tokens || 0)
+        : '') +
+      ' · history=' + (after.history_tokens || 0) +
+      ' · tools=' + (after.tool_schema_tokens || 0)
+    );
+    if (Array.isArray(budget.actions) && budget.actions.length) {
+      lines.push('context fit: ' + truncate(budget.actions.join('; '), 700));
+    }
+  }
+  return lines.join('\n');
 }
 
 function toolResultMarkerText(data) {
@@ -265,7 +357,17 @@ function toolResultMarkerText(data) {
   if (data.status !== 'completed' && data.status !== 'failed') return '';
   const duration = Number.isFinite(Number(data.duration_ms)) ? ' (' + Number(data.duration_ms) + 'ms)' : '';
   const failed = data.status === 'failed' ? ' failed' : '';
-  return 'dragonai tool: ' + data.tool + failed + duration;
+  const source = String(data.tool).startsWith('mcp__') ? 'MCP' : 'Tool';
+  return '◆ ' + source + ' result · ' + data.tool + failed + duration;
+}
+
+function toolDecisionMarkerText(data) {
+  if (!data || typeof data !== 'object' || !data.tool) return '';
+  const source = String(data.tool).startsWith('mcp__') ? 'MCP' : 'Tool';
+  const owner = data.decision === 'execute_local'
+    ? 'DragonAI read-only runtime'
+    : 'Codex approval/sandbox';
+  return '◇ ' + source + ' call · ' + data.tool + ' → ' + owner;
 }
 
 function evidenceMarkerText(data) {
@@ -296,6 +398,21 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
   const inProgress = { id: responseId, object: 'response', created_at: createdAt, status: 'in_progress', model, output: [], output_text: '' };
   markers.writeSseEvent(res, 'response.created', { type: 'response.created', sequence_number: seq.num++, response: inProgress });
   markers.writeSseEvent(res, 'response.in_progress', { type: 'response.in_progress', sequence_number: seq.num++, response: inProgress });
+  const heartbeatMs = Math.max(1000, Number(process.env.DRAGONAI_SSE_HEARTBEAT_MS) || 15000);
+  const heartbeat = setInterval(() => {
+    if (!terminal && !res.writableEnded) {
+      try {
+        // A real Responses event also resets clients whose idle detector only
+        // counts parsed SSE events (rather than raw comment bytes).
+        markers.writeSseEvent(res, 'response.in_progress', {
+          type: 'response.in_progress',
+          sequence_number: seq.num++,
+          response: { ...inProgress, status: 'in_progress' },
+        });
+      } catch {}
+    }
+  }, heartbeatMs);
+  if (typeof heartbeat.unref === 'function') heartbeat.unref();
 
   function startMessage() {
     if (msg.started) return;
@@ -368,6 +485,7 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
 
   function emitFailed(message) {
     terminal = true;
+    clearInterval(heartbeat);
     markers.writeSseEvent(res, 'response.failed', {
       type: 'response.failed',
       sequence_number: seq.num++,
@@ -388,6 +506,7 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     const toolRequests = data && Array.isArray(data.tool_requests) ? data.tool_requests : [];
     for (const t of toolRequests) emitToolRequest(t);
     terminal = true;
+    clearInterval(heartbeat);
     markers.writeSseEvent(res, 'response.completed', {
       type: 'response.completed',
       sequence_number: seq.num++,
@@ -414,23 +533,30 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
       try { emitTextMarker(planMarkerText(data)); } catch {}
     } else if (type === 'TOOL_RESULT') {
       try { emitTextMarker(toolResultMarkerText(data)); } catch {}
+    } else if (type === 'TOOL_DECISION') {
+      try { emitTextMarker(toolDecisionMarkerText(data)); } catch {}
     } else if (type === 'EVIDENCE_SUMMARY') {
       try { emitTextMarker(evidenceMarkerText(data)); } catch {}
     } else if (type === 'MODEL_RESULT') {
       handleResult(data);
     }
-    // TOOL_DECISION, BRAIN_REASONING_REQUEST, and any unknown event types are
+    // BRAIN_REASONING_REQUEST and any unknown event types are
     // observability-only: tolerated and ignored, never breaking the stream.
   }
 
   try {
     let buffer = '';
+    const decoder = new StringDecoder('utf8');
     for await (const chunk of upstreamBody) {
-      buffer += Buffer.from(chunk).toString('utf8');
+      buffer += decoder.write(Buffer.from(chunk));
       const blocks = buffer.split(/\r?\n\r?\n/u);
       buffer = blocks.pop() || '';
       for (const block of blocks) {
         const frame = parseSseBlock(block);
+        if (!frame.data && /^\s*:/mu.test(block)) {
+          if (!terminal && !res.writableEnded) res.write(': dragonai-heartbeat\n\n');
+          continue;
+        }
         if (!frame.data || frame.data === '[DONE]') continue;
         let data;
         try { data = JSON.parse(frame.data); } catch { continue; }
@@ -439,12 +565,15 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
         if (terminal) return;
       }
     }
+    buffer += decoder.end();
   } catch (e) {
+    clearInterval(heartbeat);
     log('brain: stream error: ' + e.message);
     if (!terminal) emitFailed('dragonai brain stream error: ' + e.message);
     return;
   }
   if (!terminal) {
+    clearInterval(heartbeat);
     log('brain: stream ended without MODEL_RESULT');
     emitFailed('dragonai brain stream ended without MODEL_RESULT');
   }

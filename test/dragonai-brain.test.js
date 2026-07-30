@@ -131,7 +131,33 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     req.on('end', () => {
       brainRequest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       res.writeHead(200, { 'content-type': 'text/event-stream' });
-      writeSse(res, 'PLAN_UPDATE', { turn_id: brainRequest.turn_id, lane: 'local', model: 'qwen2.5-coder-14b', reason: 'read-heavy debugging turn' });
+      writeSse(res, 'PLAN_UPDATE', {
+        turn_id: brainRequest.turn_id,
+        lane: 'local',
+        model: 'qwen2.5-coder-14b',
+        reason: 'read-heavy debugging turn',
+        neural_route: {
+          configured_model: 'qwen3-coder-30b-worker',
+          actual_model: 'qwen3-coder-30b-a3b-instruct-mlx@4bit',
+          model_resolution: 'lmstudio-loaded-alias',
+        },
+        tool_profile: {
+          profile: 'repository-edit',
+          available_count: 96,
+          available_tokens: 44290,
+          selected_count: 2,
+          selected_tokens: 1560,
+          dropped_count: 94,
+          dropped_tokens: 42730,
+          selected: [
+            { name: 'shell', source: 'codex/builtin-or-configured', tokens: 920 },
+            { name: 'apply_patch', source: 'codex/builtin-or-configured', tokens: 640 },
+          ],
+          largest_dropped: [
+            { name: 'mcp__browser__snapshot', source: 'mcp:browser', tokens: 4100 },
+          ],
+        },
+      });
       writeSse(res, 'TOOL_DECISION', { turn_id: brainRequest.turn_id, call_id: 'call_2', tool: 'shell', decision: 'execute_local', reason: 'read-only grep' });
       writeSse(res, 'MODEL_DELTA', { turn_id: brainRequest.turn_id, text: 'Payment retry ' });
       writeSse(res, 'MODEL_DELTA', { turn_id: brainRequest.turn_id, text: 'bug found.' });
@@ -219,6 +245,9 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     assert.equal(events.filter((e) => e.event === 'response.content_part.added').length, 1);
     assert.equal(events.find((e) => e.event === 'response.output_text.done').data.text, 'Payment retry bug found.');
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('sha256:abc123')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('tools: 2/96 selected')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('model resolved: qwen3-coder-30b-worker')));
+    assert.equal(events.some((e) => JSON.stringify(e.data).includes('largest dropped tools')), false);
 
     // TOOL_REQUEST -> function_call item with preserved call_id, exactly once
     // even though MODEL_RESULT repeats it.
