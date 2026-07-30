@@ -265,6 +265,33 @@ function friendlyTool(item) {
   return 'Codex:' + short;
 }
 
+function tableCell(value) {
+  return String(value || '').replace(/\|/gu, '\\|').replace(/\r?\n/gu, ' ');
+}
+
+function selectedToolsTable(selected) {
+  if (!Array.isArray(selected) || !selected.length) return [];
+  const lines = [
+    '',
+    '| # | Runtime | Selected tool | Why |',
+    '|---:|---|---|---|',
+  ];
+  selected.forEach((item, index) => {
+    const friendly = friendlyTool(item);
+    const separator = friendly.indexOf(':');
+    const runtime = separator >= 0 ? friendly.slice(0, separator) : 'Codex';
+    const tool = separator >= 0 ? friendly.slice(separator + 1) : friendly;
+    lines.push(
+      '| ' + (index + 1) +
+      ' | ' + tableCell(runtime) +
+      ' | `' + tableCell(tool) + '`' +
+      ' | ' + tableCell(truncate(item.reason || 'selected by tool profile', 120)) +
+      ' |'
+    );
+  });
+  return lines;
+}
+
 function planMarkerText(data) {
   if (!data || typeof data !== 'object') return '';
   const lane = data.lane || '';
@@ -319,19 +346,7 @@ function planMarkerText(data) {
       '/' + (toolProfile.available_tokens || 0) + 't · profile=' +
       (toolProfile.profile || 'dynamic')
     );
-    if (
-      !data.is_continuation &&
-      Array.isArray(toolProfile.selected) &&
-      toolProfile.selected.length
-    ) {
-      lines.push(
-        'selected: ' +
-        truncate(
-          toolProfile.selected.map(friendlyTool).filter(Boolean).join(' · '),
-          520,
-        )
-      );
-    }
+    lines.push(...selectedToolsTable(toolProfile.selected));
   }
   if (budget.context_limit) {
     const before = budget.before || {};

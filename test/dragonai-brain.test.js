@@ -133,6 +133,7 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       writeSse(res, 'PLAN_UPDATE', {
         turn_id: brainRequest.turn_id,
+        is_continuation: true,
         lane: 'local',
         model: 'qwen2.5-coder-14b',
         reason: 'read-heavy debugging turn',
@@ -246,6 +247,8 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     assert.equal(events.find((e) => e.event === 'response.output_text.done').data.text, 'Payment retry bug found.');
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('sha256:abc123')));
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('tools: 2/96 selected')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('| # | Runtime | Selected tool | Why |')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('`apply_patch`')));
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('model resolved: qwen3-coder-30b-worker')));
     assert.equal(events.some((e) => JSON.stringify(e.data).includes('largest dropped tools')), false);
 
