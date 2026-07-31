@@ -107,6 +107,24 @@ function codexTurnMetadata(headers) {
   }
 }
 
+function workspaceFromTurnMetadata(metadata) {
+  for (const candidate of [metadata && metadata.cwd, metadata && metadata.repo_root]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  const workspaces = metadata && metadata.workspaces &&
+    typeof metadata.workspaces === 'object' && !Array.isArray(metadata.workspaces)
+    ? metadata.workspaces : {};
+  const entries = Object.entries(workspaces).filter(([path]) => Boolean(String(path || '').trim()));
+  if (!entries.length) return '';
+  const changed = entries.find(([, value]) => value && value.has_changes === true);
+  return String((changed || entries[0])[0]);
+}
+
+function workspaceFromInstructions(instructions) {
+  const match = String(instructions || '').match(/<cwd>\s*([^<\r\n]+?)\s*<\/cwd>/iu);
+  return match ? match[1].trim() : '';
+}
+
 function conversationId(body, metadata = {}) {
   const explicit = metadata.conversation_id || metadata.thread_id || '';
   if (explicit) return String(explicit);
@@ -161,6 +179,8 @@ function buildModelRequest(body, opts = {}) {
     route_preference: headerValue(headers, 'x-dragonai-route-preference'),
     capability: headerValue(headers, 'x-dragonai-capability'),
     transcript_hash: transcriptHash(src),
+    workspace: workspaceFromTurnMetadata(native) ||
+      workspaceFromInstructions(src.instructions),
   };
   return {
     protocol: PROTOCOL,
@@ -298,6 +318,24 @@ function planMarkerText(data) {
   if (!lane && !model) return '';
   const stageIntent = data.stage_intent && typeof data.stage_intent === 'object'
     ? data.stage_intent : null;
+  const stageFailure = data.stage_failure && typeof data.stage_failure === 'object'
+    ? data.stage_failure : null;
+  if (stageFailure) {
+    const lines = [
+      '✗ Codex staging transaction · ' + (stageFailure.status || 'failed'),
+      'why: ' + truncate(stageFailure.reason || 'No verified tool result', 700),
+    ];
+    if (stageFailure.manual_command) {
+      lines.push('failed/manual command: ' + truncate(stageFailure.manual_command, 1000));
+    }
+    if (stageFailure.fallback_instruction) {
+      lines.push('DragonAI fallback: reply `' + truncate(stageFailure.fallback_instruction, 200) + '`');
+    }
+    if (stageFailure.model_output) {
+      lines.push('model output: ' + truncate(stageFailure.model_output, 700));
+    }
+    return lines.join('\n');
+  }
   if (stageIntent) {
     const selected = Array.isArray(stageIntent.selected_paths)
       ? stageIntent.selected_paths : [];
@@ -318,6 +356,9 @@ function planMarkerText(data) {
     }
     if (stageIntent.reason) {
       lines.push('why: ' + truncate(stageIntent.reason, 500));
+    }
+    if (stageIntent.workspace) {
+      lines.push('workspace: ' + truncate(stageIntent.workspace, 900));
     }
     if (!selected.length && stageIntent.raw_preview) {
       lines.push('LLM output: ' + truncate(stageIntent.raw_preview, 700));

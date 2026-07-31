@@ -86,12 +86,27 @@ test('brain envelope preserves stable conversation, task, and fork lineage heade
   assert.match(envelope.payload.metadata.transcript_hash, /^[0-9a-f]{64}$/);
 });
 
+test('brain envelope falls back to Codex environment cwd metadata', () => {
+  const envelope = brain.buildModelRequest({
+    instructions: '<environment_context><cwd>/tmp/codex-instruction-worktree</cwd></environment_context>',
+    input: [{ type: 'message', role: 'user', content: 'Stage this only' }],
+  });
+  assert.equal(
+    envelope.payload.metadata.workspace,
+    '/tmp/codex-instruction-worktree',
+  );
+});
+
 test('Codex native thread and turn metadata are the primary stable identity', () => {
   const native = {
     session_id: 'native-session',
     thread_id: 'native-thread',
     turn_id: 'native-turn',
     forked_from_thread_id: 'parent-thread',
+    workspaces: {
+      '/tmp/codex-clean-worktree': { has_changes: false },
+      '/tmp/codex-active-worktree': { has_changes: true },
+    },
   };
   const envelope = brain.buildModelRequest(
     {
@@ -112,6 +127,7 @@ test('Codex native thread and turn metadata are the primary stable identity', ()
   assert.equal(envelope.payload.metadata.task_id, 'native-turn');
   assert.equal(envelope.payload.metadata.parent_conversation_id, 'parent-thread');
   assert.equal(envelope.payload.metadata.operation, 'fork');
+  assert.equal(envelope.payload.metadata.workspace, '/tmp/codex-active-worktree');
 });
 
 // One compact end-to-end test: a fake DragonAI Brain streams a full
@@ -192,6 +208,19 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
           mixed_paths: [],
           command: 'git add -- src/PaymentService.java',
           reason: 'Preserved and validated the LLM request',
+          workspace: '/tmp/codex-active-worktree',
+        },
+      });
+      writeSse(res, 'PLAN_UPDATE', {
+        turn_id: brainRequest.turn_id,
+        lane: 'local',
+        model: 'qwen2.5-coder-14b',
+        is_continuation: true,
+        stage_failure: {
+          status: 'not_executed',
+          reason: 'Codex returned no verifiable git-add result',
+          manual_command: 'git add -- src/PaymentService.java',
+          fallback_instruction: 'DragonAI fallback: execute',
         },
       });
       writeSse(res, 'TOOL_DECISION', { turn_id: brainRequest.turn_id, call_id: 'call_2', tool: 'shell', decision: 'execute_local', reason: 'read-only grep' });
@@ -301,6 +330,9 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('policy=adaptive')));
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('◇ LLM staging intent · delegating')));
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('Codex transaction: git add -- src/PaymentService.java')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('workspace: /tmp/codex-active-worktree')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('failed/manual command: git add -- src/PaymentService.java')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('DragonAI fallback: reply')));
     assert.equal(events.some((e) => JSON.stringify(e.data).includes('largest dropped tools')), false);
 
     // TOOL_REQUEST -> function_call item with preserved call_id, exactly once
