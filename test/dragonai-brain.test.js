@@ -170,12 +170,22 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
         summary: 'src/PaymentService.java verified at revision deadbeef',
       });
       writeSse(res, 'TOOL_REQUEST', { turn_id: brainRequest.turn_id, id: 'fc_7', call_id: 'call_7', name: 'apply_patch', arguments: '{"patch":"*** Begin Patch"}' });
+      writeSse(res, 'TOOL_REQUEST', { turn_id: brainRequest.turn_id, id: 'fc_8', call_id: 'call_8', name: 'shell', arguments: '{"command":["pytest","-q"]}' });
       writeSse(res, 'FUTURE_UNKNOWN_EVENT', { turn_id: brainRequest.turn_id, anything: true });
       writeSse(res, 'MODEL_RESULT', {
         turn_id: brainRequest.turn_id,
         status: 'completed',
         text: 'Payment retry bug found.',
-        tool_requests: [{ id: 'fc_7', call_id: 'call_7', name: 'apply_patch', arguments: '{"patch":"*** Begin Patch"}' }],
+        turn_terminal: false,
+        tool_transaction: {
+          state: 'awaiting_outputs',
+          call_ids: ['call_7', 'call_8'],
+          parallel: true,
+        },
+        tool_requests: [
+          { id: 'fc_7', call_id: 'call_7', name: 'apply_patch', arguments: '{"patch":"*** Begin Patch"}' },
+          { id: 'fc_8', call_id: 'call_8', name: 'shell', arguments: '{"command":["pytest","-q"]}' },
+        ],
         usage: { input_tokens: 5210, output_tokens: 240 },
       });
       res.end();
@@ -256,16 +266,20 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     // TOOL_REQUEST -> function_call item with preserved call_id, exactly once
     // even though MODEL_RESULT repeats it.
     const fnDone = events.filter((e) => e.event === 'response.output_item.done' && e.data.item.type === 'function_call');
-    assert.equal(fnDone.length, 1);
+    assert.equal(fnDone.length, 2);
     assert.equal(fnDone[0].data.item.call_id, 'call_7');
     assert.equal(fnDone[0].data.item.name, 'apply_patch');
     assert.equal(fnDone[0].data.item.arguments, '{"patch":"*** Begin Patch"}');
+    assert.equal(fnDone[1].data.item.call_id, 'call_8');
+    assert.equal(fnDone[1].data.item.name, 'shell');
+    assert.equal(fnDone[1].data.item.arguments, '{"command":["pytest","-q"]}');
+    assert.notEqual(fnDone[0].data.output_index, fnDone[1].data.output_index);
 
     // Terminal response.completed: mapped usage plus message + function_call output.
     const completed = events.find((e) => e.event === 'response.completed').data.response;
     assert.equal(completed.status, 'completed');
     assert.deepEqual(completed.usage, { input_tokens: 5210, output_tokens: 240, total_tokens: 5450 });
-    assert.equal(completed.output.filter((item) => item.type === 'function_call').length, 1);
+    assert.equal(completed.output.filter((item) => item.type === 'function_call').length, 2);
     assert.ok(completed.output.some((item) => item.type === 'message' && item.content[0].text === 'Payment retry bug found.'));
     assert.equal(completed.output_text, 'Payment retry bug found.');
 
