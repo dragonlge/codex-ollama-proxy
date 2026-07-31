@@ -218,6 +218,7 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
       model: 'gpt-5.3-codex',
       instructions: 'You are Codex.',
       stream: true,
+      parallel_tool_calls: true,
       tool_choice: 'auto',
       tools: [
         { type: 'function', name: 'shell', description: 'run a command', parameters: { type: 'object', properties: {} } },
@@ -276,6 +277,7 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     assert.equal(brainRequest.payload.model_hint, 'gpt-5.3-codex');
     assert.equal(brainRequest.payload.instructions, 'You are Codex.');
     assert.equal(brainRequest.payload.stream, true);
+    assert.equal(brainRequest.payload.parallel_tool_calls, true);
     assert.deepEqual(brainRequest.payload.messages.map((m) => m.role), ['user', 'assistant', 'tool']);
     assert.equal(brainRequest.payload.messages[1].tool_calls[0].id, 'call_1');
     // The proxy may inject its own function tools (tool_search, web_search, …)

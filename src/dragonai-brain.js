@@ -173,6 +173,7 @@ function buildModelRequest(body, opts = {}) {
       messages: responsesInputToChatMessages(withoutInstructions),
       tools: responsesToolsToChatTools(src.tools),
       tool_choice: src.tool_choice || 'auto',
+      parallel_tool_calls: src.parallel_tool_calls !== false,
       stream,
       metadata,
     },
