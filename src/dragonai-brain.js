@@ -296,6 +296,34 @@ function planMarkerText(data) {
   const lane = data.lane || '';
   const model = data.model || '';
   if (!lane && !model) return '';
+  const stageIntent = data.stage_intent && typeof data.stage_intent === 'object'
+    ? data.stage_intent : null;
+  if (stageIntent) {
+    const selected = Array.isArray(stageIntent.selected_paths)
+      ? stageIntent.selected_paths : [];
+    const mixed = Array.isArray(stageIntent.mixed_paths)
+      ? stageIntent.mixed_paths : [];
+    const lines = [
+      '◇ LLM staging intent · ' + (stageIntent.status || 'unknown'),
+      'source: ' + (stageIntent.source || 'model'),
+    ];
+    if (selected.length) {
+      lines.push('wants to stage: ' + truncate(selected.join(', '), 700));
+    }
+    if (mixed.length) {
+      lines.push('mixed-scope, not staged whole: ' + truncate(mixed.join(', '), 700));
+    }
+    if (stageIntent.command) {
+      lines.push('Codex transaction: ' + truncate(stageIntent.command, 900));
+    }
+    if (stageIntent.reason) {
+      lines.push('why: ' + truncate(stageIntent.reason, 500));
+    }
+    if (!selected.length && stageIntent.raw_preview) {
+      lines.push('LLM output: ' + truncate(stageIntent.raw_preview, 700));
+    }
+    return lines.join('\n');
+  }
   const lines = [];
   const details = data.neural_route && typeof data.neural_route === 'object'
     ? data.neural_route : {};

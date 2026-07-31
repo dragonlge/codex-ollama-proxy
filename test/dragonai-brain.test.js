@@ -180,6 +180,20 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
           ],
         },
       });
+      writeSse(res, 'PLAN_UPDATE', {
+        turn_id: brainRequest.turn_id,
+        lane: 'local',
+        model: 'qwen2.5-coder-14b',
+        is_continuation: true,
+        stage_intent: {
+          status: 'delegating',
+          source: 'formal-tool-call',
+          selected_paths: ['src/PaymentService.java'],
+          mixed_paths: [],
+          command: 'git add -- src/PaymentService.java',
+          reason: 'Preserved and validated the LLM request',
+        },
+      });
       writeSse(res, 'TOOL_DECISION', { turn_id: brainRequest.turn_id, call_id: 'call_2', tool: 'shell', decision: 'execute_local', reason: 'read-only grep' });
       writeSse(res, 'MODEL_DELTA', { turn_id: brainRequest.turn_id, text: 'Payment retry ' });
       writeSse(res, 'MODEL_DELTA', { turn_id: brainRequest.turn_id, text: 'bug found.' });
@@ -285,6 +299,8 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('planner=dragonai-expert-planner-14b-v1-mlx')));
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('probabilities local=0.10')));
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('policy=adaptive')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('◇ LLM staging intent · delegating')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('Codex transaction: git add -- src/PaymentService.java')));
     assert.equal(events.some((e) => JSON.stringify(e.data).includes('largest dropped tools')), false);
 
     // TOOL_REQUEST -> function_call item with preserved call_id, exactly once
