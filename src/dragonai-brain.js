@@ -301,6 +301,8 @@ function planMarkerText(data) {
     ? data.neural_route : {};
   const plan = data.turn_plan && typeof data.turn_plan === 'object'
     ? data.turn_plan : {};
+  const planner = data.planner && typeof data.planner === 'object'
+    ? data.planner : {};
   const budget = data.context_budget && typeof data.context_budget === 'object'
     ? data.context_budget : {};
   const toolProfile = data.tool_profile && typeof data.tool_profile === 'object'
@@ -320,6 +322,64 @@ function planMarkerText(data) {
   );
   if (!data.is_continuation && data.reason) {
     lines.push('why: ' + truncate(data.reason, 240));
+  }
+  if (!data.is_continuation && planner.actual_model) {
+    lines.push(
+      'planner: ' + planner.actual_model +
+      ' · recommends=' + (planner.recommendation || 'unspecified') +
+      ' · task=' + (planner.task_family || data.category || 'unknown') +
+      ' · risk=' + (planner.risk || data.risk || 'unknown') +
+      ' · confidence=' + (
+        Number.isFinite(Number(planner.confidence))
+          ? Number(planner.confidence).toFixed(2)
+          : '-'
+      )
+    );
+  }
+  const probabilities = details.probabilities &&
+    typeof details.probabilities === 'object' ? details.probabilities : {};
+  const probabilityParts = [
+    ['local', probabilities.local_direct],
+    ['probe', probabilities.local_probe],
+    ['high', probabilities.high_direct],
+    ['evidence', probabilities.gather_evidence],
+  ].filter((item) => Number.isFinite(Number(item[1])))
+    .map((item) => item[0] + '=' + Number(item[1]).toFixed(2));
+  if (data.is_continuation && planner.actual_model) {
+    lines.push(
+      'decision chain: planner=' + planner.actual_model +
+      ' recommends ' + (planner.recommendation || 'unspecified') +
+      ' · neural=' + (details.action || 'fallback') +
+      ' · policy=' + (details.policy || 'adaptive') +
+      ' · final=' + (
+        details.final_action || details.requested_action || details.action || '-'
+      ) +
+      (probabilityParts.length
+        ? ' · probabilities ' + probabilityParts.join('/')
+        : '')
+    );
+  }
+  if (!data.is_continuation && probabilityParts.length) {
+    lines.push(
+      'neural router: ' + probabilityParts.join(' · ') +
+      (details.mode ? ' · mode=' + details.mode : '') +
+      (details.bundle_version ? ' · bundle=' + details.bundle_version : '')
+    );
+  }
+  if (!data.is_continuation && (
+    details.action || details.requested_action || details.final_action
+  )) {
+    lines.push(
+      'policy: ' + (details.policy || 'adaptive') +
+      ' · neural=' + (details.action || 'fallback') +
+      ' → policy=' + (details.requested_action || details.action || '-') +
+      ' → final=' + (details.final_action || details.requested_action || '-')
+    );
+    if (details.lane_fallback) {
+      lines.push('fallback: requested high lane is unavailable; using local worker');
+    } else if (details.task_pin) {
+      lines.push('route pin: kept ' + details.task_pin + ' for this tool transaction');
+    }
   }
   if (details.configured_model && details.actual_model &&
       details.configured_model !== details.actual_model) {

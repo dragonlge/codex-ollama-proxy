@@ -137,10 +137,31 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
         lane: 'local',
         model: 'qwen2.5-coder-14b',
         reason: 'read-heavy debugging turn',
+        planner: {
+          source: '14b-router',
+          actual_model: 'dragonai-expert-planner-14b-v1-mlx',
+          recommendation: 'GATHER_EVIDENCE',
+          task_family: 'debug',
+          risk: 'low',
+          confidence: 0.91,
+          can_choose_provider: false,
+        },
         neural_route: {
           configured_model: 'qwen3-coder-30b-worker',
           actual_model: 'qwen3-coder-30b-a3b-instruct-mlx@4bit',
           model_resolution: 'lmstudio-loaded-alias',
+          action: 'LOCAL_PROBE',
+          requested_action: 'GATHER_EVIDENCE',
+          final_action: 'GATHER_EVIDENCE',
+          policy: 'adaptive',
+          mode: 'active',
+          bundle_version: 'dragonai-brain-v1',
+          probabilities: {
+            local_direct: 0.1,
+            local_probe: 0.3,
+            high_direct: 0.5,
+            gather_evidence: 0.1,
+          },
         },
         tool_profile: {
           profile: 'repository-edit',
@@ -261,6 +282,9 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('| # | Runtime | Selected tool |')));
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('`apply_patch`')));
     assert.ok(events.some((e) => JSON.stringify(e.data).includes('model resolved: qwen3-coder-30b-worker')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('planner=dragonai-expert-planner-14b-v1-mlx')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('probabilities local=0.10')));
+    assert.ok(events.some((e) => JSON.stringify(e.data).includes('policy=adaptive')));
     assert.equal(events.some((e) => JSON.stringify(e.data).includes('largest dropped tools')), false);
 
     // TOOL_REQUEST -> function_call item with preserved call_id, exactly once
