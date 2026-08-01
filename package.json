@@ -1,6 +1,6 @@
 {
   "name": "codex-ollama-proxy",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Compatibility proxy for using Ollama, OpenRouter and custom Responses API providers with Codex plugins, MCP tools, tool_search and apply_patch.",
   "keywords": [
     "openai-codex",

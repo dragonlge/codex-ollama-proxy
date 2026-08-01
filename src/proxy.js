@@ -13,6 +13,7 @@ const { createOllamaCloudPuller } = require('./ollama-cloud-pull');
 const markers = require('./ui-markers');
 const upstreamLib = require('./upstream');
 const dragonaiBrain = require('./dragonai-brain');
+const { responsesToolRegistry } = require('../adaptor/completion-api-adaptor');
 
 // proxy-models.toml drives per-request model auto-routing.
 // Loaded once at startup; editable without restart by re-running apply script.
@@ -1928,7 +1929,19 @@ const server = http.createServer((clientReq, clientRes) => {
         // calls to custom_tool_call items.
         liftAdditionalToolsInput(body);
         info = collectCustomToolInfo(body.tools);
+        // Snapshot the original Responses tool items (custom/namespace types)
+        // before translation flattens them, so the Brain's tool_registry hint
+        // can preserve each tool's real wire kind.
+        const originalTools = Array.isArray(body.tools) ? body.tools.slice() : [];
         translateRequestBody(body);
+        try {
+          info.toolRegistry = dragonaiBrain.enabled()
+            ? responsesToolRegistry(originalTools, body.tools, info.customNames, null)
+            : [];
+        } catch (e) {
+          info.toolRegistry = [];
+          debugLog('tool registry hint failed: ' + e.message);
+        }
         {
           const byType = {};
           const nsNames = [];
@@ -1957,6 +1970,7 @@ const server = http.createServer((clientReq, clientRes) => {
         res: clientRes,
         body,
         isStream: originalStream,
+        toolRegistry: info.toolRegistry || [],
         translateOutputItem: (item) => translateOutputItem(item, brainState),
         log,
       });

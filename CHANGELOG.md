@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1
+
+DragonAI Brain UI: FALLBACK_EXECUTION banner rendering.
+
+- Added a `FALLBACK_EXECUTION` branch to the brain-mode SSE translator: when
+  the DragonAI Brain offers or executes a whitelisted local fallback instead
+  of a Codex tool, the proxy renders a prominent banner
+  (`⚠ 未使用 Codex 提供的工具 — DragonAI 本地 fallback`) with the capability,
+  read-only/mutating class, approval requirement, reason, and phase-specific
+  wording (offer shows the exact user approval phrase; executing/done/failed
+  show progress and a bounded result preview). Wrapped in the existing
+  try/catch so markers can never break the stream.
+- Exported the pure marker renderers (`planTableText`, `plannerLadderText`,
+  `memoryRecallText`, `stepUpdateText`, `contractErrorText`,
+  `fallbackBannerText`) and added snapshot coverage in
+  `test/dragonai-brain-markers.test.js`.
+
 ## 0.4.0
 
 Launcher state persistence, session-based inline image caching, schema-driven presets, stable streaming lifecycles, Ollama image generation, and faster nonblocking skill discovery.

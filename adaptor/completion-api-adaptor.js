@@ -20,6 +20,12 @@ function parseBool(value, fallback = false) {
   return /^(1|true|yes|on)$/iu.test(String(value));
 }
 
+function debugLog(...args) {
+  if (parseBool(process.env.CHAT_COMPLETION_ADAPTOR_VERBOSE)) {
+    console.error('[completion-api-adaptor]', ...args);
+  }
+}
+
 function jsonResponse(res, statusCode, payload) {
   const body = JSON.stringify(payload, null, 2);
   res.writeHead(statusCode, {
@@ -151,8 +157,17 @@ function responsesInputToChatMessages(body) {
 
 function responsesToolsToChatTools(tools) {
   const out = [];
+  const droppedByType = {};
+  let dropped = 0;
   for (const tool of tools || []) {
-    if (!tool || tool.type !== 'function' || !tool.name) continue;
+    if (!tool || tool.type !== 'function' || !tool.name) {
+      // Non-function items (custom/namespace/...) carry no chat-tool shape;
+      // count them so a silently narrowed registry stays observable.
+      dropped += 1;
+      const kind = (tool && tool.type) || '?';
+      droppedByType[kind] = (droppedByType[kind] || 0) + 1;
+      continue;
+    }
     out.push({
       type: 'function',
       function: {
@@ -162,7 +177,57 @@ function responsesToolsToChatTools(tools) {
       },
     });
   }
+  if (dropped) {
+    debugLog('responsesToolsToChatTools: dropped ' + dropped
+      + ' non-function tool item(s): ' + JSON.stringify(droppedByType));
+  }
   return out;
+}
+
+// Build the wire tool-registry hint the DragonAI Brain consumes as
+// payload.tool_registry: one {name, wire, namespace, base} entry per
+// translated flat function tool, preserving the original Responses types
+// (custom -> custom_freeform, namespace -> namespace/base split) that the
+// flat function list cannot carry on its own. Purely additive metadata.
+function responsesToolRegistry(originalTools, translatedTools, customNames, namespaceMap) {
+  const customs = new Set();
+  if (customNames instanceof Set) for (const name of customNames) customs.add(name);
+  else if (Array.isArray(customNames)) for (const name of customNames) customs.add(name);
+  const nsMap = new Map();
+  if (namespaceMap instanceof Map) {
+    for (const [flat, info] of namespaceMap) nsMap.set(flat, info);
+  } else if (namespaceMap && typeof namespaceMap === 'object') {
+    for (const [flat, info] of Object.entries(namespaceMap)) nsMap.set(flat, info);
+  }
+  // Derive what the caller did not pass from the original Responses tools.
+  for (const tool of originalTools || []) {
+    if (!tool || typeof tool !== 'object') continue;
+    if (tool.type === 'custom' && tool.name) customs.add(tool.name);
+    if (tool.type === 'namespace' && tool.name && Array.isArray(tool.tools)) {
+      for (const sub of tool.tools) {
+        if (sub && sub.name) {
+          nsMap.set(tool.name + '__' + sub.name, { namespace: tool.name, name: sub.name });
+        }
+      }
+    }
+  }
+  const registry = [];
+  const seen = new Set();
+  for (const tool of translatedTools || []) {
+    if (!tool || typeof tool !== 'object') continue;
+    const name = tool.name || (tool.function && tool.function.name) || '';
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const ns = nsMap.get(name);
+    const separator = name.lastIndexOf('__');
+    registry.push({
+      name,
+      wire: customs.has(name) ? 'custom_freeform' : 'function',
+      namespace: ns ? String(ns.namespace || '') : (separator > 0 ? name.slice(0, separator) : ''),
+      base: ns ? String(ns.name || '') : (separator > 0 ? name.slice(separator + 2) : name),
+    });
+  }
+  return registry;
 }
 
 function buildChatBody(body, options, stream) {
@@ -546,6 +611,7 @@ module.exports = {
   completionToResponse,
   envOptions,
   responsesInputToChatMessages,
+  responsesToolRegistry,
   responsesToolsToChatTools,
   startServer,
 };

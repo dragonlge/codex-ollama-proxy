@@ -1,6 +1,6 @@
 # Proxy Behavior Testing Checklist
 
-Last updated: 2026-07-24
+Last updated: 2026-08-01
 
 This checklist tracks automated and live verification of the complete proxy
 behavior. Never write API keys, bearer tokens, or raw preset contents into this
@@ -17,6 +17,9 @@ Status legend:
 
 - [x] `npm run check` passes.
 - [x] `node --test test/*.test.js` passes with zero failures.
+- [x] DragonAI Brain UI marker renderers (plan table, planner ladder,
+      contract error, fallback banner, memory recall, step update) have
+      snapshot coverage in `test/dragonai-brain-markers.test.js`.
 - [x] `git diff --check` reports no errors.
 - [x] Tests and logs do not print API keys or bearer tokens.
 
@@ -219,3 +222,4 @@ Never include credentials.
 | 2026-07-24 | xAI fixed-reasoning compatibility | Codex globally sent `reasoning.effort = "none"` even though `grok-4.20-0309-reasoning` advertises no selectable reasoning levels and xAI rejects that parameter. Confirmed live that summary-only requests succeed, removed only effort for the two exact fixed-reasoning variants, and completed an actual Codex CLI turn with the affected model. | Passed after fix |
 | 2026-07-24 | xAI custom-tool normalization | Replaced the provider-incompatible `custom` transport with a generic function wrapper for every custom tool. Text formats remain unconstrained; Lark and regex formats carry their exact grammar definition. Calls and outputs restore by original tool name, including Desktop 0.146 definitions delivered through turn-local `additional_tools`. Also removed xAI-incompatible null fields from replayed reasoning items. Actual streamed and Desktop-shaped live xAI requests returned usable `custom_tool_call` items. | Passed after fix |
 | 2026-07-24 | Final regression | `npm run check` and `git diff --check` exited 0; the full suite passed 225/225, including Google adaptor, completion adaptor, provider discovery, routing, text, image, and generic custom-tool translation coverage. | Passed |
+| 2026-08-01 | Brain fallback banner (0.4.1) | Added the `FALLBACK_EXECUTION` marker branch and `fallbackBannerText`, exported the six pure marker renderers, and added `test/dragonai-brain-markers.test.js` snapshot coverage. The full suite passed 257/257 with zero failures. | Passed |

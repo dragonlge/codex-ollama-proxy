@@ -192,6 +192,10 @@ function buildModelRequest(body, opts = {}) {
       instructions: src.instructions ? String(src.instructions) : '',
       messages: responsesInputToChatMessages(withoutInstructions),
       tools: responsesToolsToChatTools(src.tools),
+      // Wire-kind hints ([{name, wire, namespace, base}]) preserving the
+      // original Responses tool types the flat function list drops
+      // (additive; the Brain tolerates their absence).
+      tool_registry: Array.isArray(opts.toolRegistry) ? opts.toolRegistry : [],
       tool_choice: src.tool_choice || 'auto',
       parallel_tool_calls: src.parallel_tool_calls !== false,
       stream,
@@ -311,6 +315,143 @@ function selectedToolsTable(selected) {
   return lines;
 }
 
+// PLAN_UPDATE `plan` payload -> headline + Markdown step table (Plan Mode).
+// Python only sends structured rows; the Markdown is assembled here, same
+// escaping pattern as selectedToolsTable.
+function planTableText(plan) {
+  if (!plan || typeof plan !== 'object') return '';
+  const rows = Array.isArray(plan.table_rows) ? plan.table_rows : [];
+  if (!rows.length) return '';
+  const done = rows.filter((row) => row && row.status === 'completed').length;
+  const lines = [
+    '◈ DragonAI Plan · ' + rows.length + ' steps (' + done + ' done)' +
+    (plan.planner_model ? ' · planner=' + plan.planner_model : '') +
+    ' · codex update_plan=' + (plan.codex_plan || 'pending'),
+  ];
+  if (plan.codex_plan_error) {
+    lines.push('codex says: ' + truncate(plan.codex_plan_error, 300));
+  }
+  lines.push(
+    '',
+    '| # | St | Step | Tool | Owner | Try | Note |',
+    '|---:|:--:|---|---|---|---:|---|'
+  );
+  rows.forEach((row) => {
+    if (!row || typeof row !== 'object') return;
+    lines.push(
+      '| ' + (Number(row.n) || 0) +
+      ' | ' + tableCell(row.glyph || '□') +
+      ' | ' + tableCell(truncate(row.step || '', 160)) +
+      ' | ' + (row.tool ? '`' + tableCell(row.tool) + '`' : '-') +
+      ' | ' + tableCell(row.owner || 'codex') +
+      ' | ' + (Number(row.attempts) || 0) +
+      ' | ' + tableCell(truncate(row.note || '', 160)) + ' |'
+    );
+  });
+  return lines.join('\n');
+}
+
+// PLAN_UPDATE `planner` block (P4) -> one-line planner ladder chip:
+//   planner ladder: 14b(parse_failed) → 30b(ok) · complexity=0.72
+//   · floor=worker-30b · confidence=0.61 (planner)
+// A single successful attempt with no escalation renders as one segment.
+function plannerLadderText(planner) {
+  if (!planner || typeof planner !== 'object') return '';
+  try {
+    const attempts = Array.isArray(planner.attempts) ? planner.attempts : [];
+    if (!attempts.length) return '';
+    const tierNames = {
+      'router-14b': '14b',
+      'worker-30b': '30b',
+      remote: 'remote',
+      deterministic: 'deterministic',
+    };
+    const chain = attempts
+      .map((attempt) => {
+        if (!attempt || typeof attempt !== 'object') return '';
+        const tier = tierNames[attempt.tier] || String(attempt.tier || '?');
+        const status = attempt.ok ? 'ok' : (attempt.reason || 'failed');
+        return tier + '(' + truncate(String(status), 40) + ')';
+      })
+      .filter(Boolean)
+      .join(' → ');
+    if (!chain) return '';
+    const bits = ['planner ladder: ' + chain];
+    const complexity = planner.complexity && typeof planner.complexity === 'object'
+      ? planner.complexity : {};
+    if (Number.isFinite(Number(complexity.score))) {
+      bits.push('complexity=' + Number(complexity.score).toFixed(2));
+    }
+    if (complexity.tier_floor) {
+      bits.push('floor=' + truncate(String(complexity.tier_floor), 40));
+    }
+    if (Number.isFinite(Number(planner.confidence))) {
+      bits.push(
+        'confidence=' + Number(planner.confidence).toFixed(2) +
+        (planner.confidence_source
+          ? ' (' + truncate(String(planner.confidence_source), 40) + ')'
+          : '')
+      );
+    }
+    return bits.join(' · ');
+  } catch {
+    return '';
+  }
+}
+
+// MEMORY_RECALL frame (P5) -> one-line layered-memory chip:
+//   ◆ Memory recall · 2 playbook(s) · 5 fact(s) · 1 lesson(s)
+//   · top="edit: fix retry" (win 4/5)
+function memoryRecallText(memory) {
+  if (!memory || typeof memory !== 'object') return '';
+  try {
+    const playbooks = Number(memory.playbooks) || 0;
+    const facts = Number(memory.facts) || 0;
+    const lessons = Number(memory.lessons) || 0;
+    if (!playbooks && !facts && !lessons) return '';
+    const bits = ['◆ Memory recall'];
+    if (playbooks) bits.push(playbooks + ' playbook(s)');
+    if (facts) bits.push(facts + ' fact(s)');
+    if (lessons) bits.push(lessons + ' lesson(s)');
+    const top = memory.top_playbook && typeof memory.top_playbook === 'object'
+      ? memory.top_playbook : null;
+    if (top && (top.title || top.playbook_id)) {
+      const wins = Number(top.wins) || 0;
+      const losses = Number(top.losses) || 0;
+      bits.push(
+        'top="' + truncate(String(top.title || top.playbook_id), 80) + '"' +
+        ' (win ' + wins + '/' + (wins + losses) + ')'
+      );
+    }
+    return bits.join(' · ');
+  } catch {
+    return '';
+  }
+}
+
+// PLAN_STEP_UPDATE frame -> a one-line step progress chip.
+function stepUpdateText(data) {
+  if (!data || typeof data !== 'object') return '';
+  const step = data.step && typeof data.step === 'object' ? data.step : null;
+  if (!step) return '';
+  const total = Number(data.total) || 0;
+  const position = 'Step ' + (Number(step.n) || '?') + '/' + (total || '?');
+  const phase = String(data.phase || '');
+  if (phase === 'delegated' || step.status === 'in_progress') {
+    return '▶ ' + position +
+      (step.tool ? ' · ' + step.tool : '') +
+      ' · attempt ' + (Number(step.attempts) || 1);
+  }
+  if (phase === 'verified' || step.status === 'completed') {
+    return '✔ ' + position + ' done';
+  }
+  if (phase === 'rejected' || phase === 'retry' || step.status === 'blocked') {
+    return '✗ ' + position + ' failed' +
+      (step.note ? ': ' + truncate(step.note, 300) : '');
+  }
+  return '◇ ' + position + ' · ' + (step.status || 'pending');
+}
+
 function planMarkerText(data) {
   if (!data || typeof data !== 'object') return '';
   const lane = data.lane || '';
@@ -341,10 +482,27 @@ function planMarkerText(data) {
       ? stageIntent.selected_paths : [];
     const mixed = Array.isArray(stageIntent.mixed_paths)
       ? stageIntent.mixed_paths : [];
+    // Phase-aware heading (D9). Events without a phase keep the legacy
+    // wording so older Brain builds render unchanged.
+    const stagePhaseHeadings = {
+      intent: '◇ staging intent · awaiting Codex execution',
+      delegated: '▶ staging delegated to Codex',
+      verified: '✔ staging verified',
+      rejected: '✗ staging rejected',
+    };
+    const phase = typeof stageIntent.phase === 'string' ? stageIntent.phase : '';
+    const heading = stagePhaseHeadings[phase]
+      || ('◇ LLM staging intent · ' + (stageIntent.status || 'unknown'));
     const lines = [
-      '◇ LLM staging intent · ' + (stageIntent.status || 'unknown'),
+      heading,
       'source: ' + (stageIntent.source || 'model'),
     ];
+    if (phase && stageIntent.status) {
+      lines.push('status: ' + truncate(String(stageIntent.status), 120));
+    }
+    if (stageIntent.retry) {
+      lines.push('retry: ' + truncate(String(stageIntent.retry), 60));
+    }
     if (selected.length) {
       lines.push('wants to stage: ' + truncate(selected.join(', '), 700));
     }
@@ -402,7 +560,10 @@ function planMarkerText(data) {
         Number.isFinite(Number(planner.confidence))
           ? Number(planner.confidence).toFixed(2)
           : '-'
-      )
+      ) +
+      (planner.confidence_source
+        ? ' (' + truncate(String(planner.confidence_source), 40) + ')'
+        : '')
     );
   }
   const probabilities = details.probabilities &&
@@ -495,6 +656,411 @@ function planMarkerText(data) {
   return lines.join('\n');
 }
 
+// SUBAGENT_EXECUTION frame (Workstream S; also renders legacy
+// FALLBACK_EXECUTION payloads) -> the ⬡ subagent marker.
+//
+// Direct-call phases (S-P2): offer / executing / done / failed
+//   ⬡ OpenHands subagent · exec_readonly → done (812ms) · <preview>
+// Delegated-task phases (S-P3, defined here from day one):
+//   started / tool_call / observation / message / awaiting_approval /
+//   finished — e.g. `⬡ OpenHands subagent · step 3 · terminal · pytest -x`
+//   and `⬡ OpenHands subagent · ✔ 任务完成 · 17 steps · 4m12s`.
+//
+// runtime:"local" (and legacy payloads without a runtime field) keeps the
+// historical fallback banner headline so the local tier still reads exactly
+// like the P6 whitelist fallback:
+//   ⚠ 未使用 Codex 提供的工具 — DragonAI 本地 fallback
+function subagentDuration(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return '';
+  if (n < 60000) return (n >= 10000 ? Math.round(n / 1000) + 's' : n + 'ms');
+  return Math.floor(n / 60000) + 'm' + String(Math.round((n % 60000) / 1000)).padStart(2, '0') + 's';
+}
+
+function subagentMarkerText(data) {
+  if (!data || typeof data !== 'object') return '';
+  try {
+    const phase = String(data.phase || '');
+    if (!phase) return '';
+    // Legacy FALLBACK_EXECUTION payloads carry no runtime field: local.
+    const local = String(data.runtime || 'local') === 'local';
+    const head = local
+      ? '⚠ 未使用 Codex 提供的工具 — DragonAI 本地 fallback'
+      : '⬡ OpenHands subagent';
+    const name = truncate(String(data.capability || data.tool || 'task'), 80);
+    const duration = subagentDuration(data.duration_ms);
+    const durationText = duration ? ' (' + duration + ')' : '';
+    const rawPreview = data.output_preview || data.preview || '';
+    const preview = rawPreview
+      ? ' · ' + truncate(String(rawPreview).replace(/\s+/gu, ' '), 300)
+      : '';
+
+    if (phase === 'offer') {
+      const lines = [head];
+      if (!local) lines.push('⚠ 未使用 Codex 提供的工具');
+      lines.push(
+        'capability: ' + name +
+        ' (' + (data.mutating ? 'mutating' : 'read-only') +
+        (data.approval ? ', ' + truncate(String(data.approval), 160) : '') + ')'
+      );
+      if (data.reason) lines.push('why: ' + truncate(String(data.reason), 500));
+      if (data.owner) lines.push('owner: ' + truncate(String(data.owner), 120));
+      if (data.mutating && data.approval_phrase) {
+        lines.push(
+          '◇ offered · will NOT run until you reply exactly: `' +
+          truncate(String(data.approval_phrase), 120) + '`'
+        );
+      } else {
+        lines.push('◇ offered · read-only, executing now');
+      }
+      return lines.join('\n');
+    }
+    if (phase === 'executing') return head + ' · ' + name + ' → executing';
+    if (phase === 'done') return head + ' · ' + name + ' → done' + durationText + preview;
+    if (phase === 'failed') return head + ' · ' + name + ' → failed' + durationText + preview;
+
+    // ---- delegated-task phases (S-P3 emits these) ----
+    const step = Number.isFinite(Number(data.step)) && Number(data.step) > 0
+      ? ' · step ' + Number(data.step)
+      : '';
+    const tool = data.tool ? ' · ' + truncate(String(data.tool), 60) : '';
+    if (phase === 'started') {
+      return head + ' · 任务开始' + preview + '\n⚠ 未使用 Codex 提供的工具';
+    }
+    if (phase === 'tool_call') return head + step + tool + preview;
+    if (phase === 'observation') {
+      const merged = Number(data.merged_count) > 1
+        ? ' ×' + Number(data.merged_count)
+        : '';
+      return head + step + tool + ' ⇢ observation' + merged + preview;
+    }
+    if (phase === 'message') return head + step + preview;
+    if (phase === 'awaiting_approval') {
+      return head + step + ' · ⏸ 等待审批' +
+        (data.risk ? ' · risk=' + truncate(String(data.risk), 20) : '') +
+        preview;
+    }
+    if (phase === 'finished') {
+      const failed = data.status && data.status !== 'finished' && data.status !== 'completed';
+      const steps = Number.isFinite(Number(data.steps)) && Number(data.steps) > 0
+        ? ' · ' + Number(data.steps) + ' steps'
+        : '';
+      return head + ' · ' + (failed ? '✗ 任务终止 (' + truncate(String(data.status), 40) + ')' : '✔ 任务完成') +
+        steps + (duration ? ' · ' + duration : '') + preview;
+    }
+    return head + ' · phase: ' + truncate(phase, 40);
+  } catch {
+    return '';
+  }
+}
+
+// Collab marker renderer (P7) -> the ⬢ collab marker. One function covers
+// the whole collab event family: the v2 events (COLLAB_TASK_STARTED with
+// version:"v2", COLLAB_EXPLORATION, COLLAB_REPORT, COLLAB_PLAN_REVIEW,
+// COLLAB_DISPATCH, COLLAB_REVIEW_DECISION, COLLAB_STABLE_AUTO_OFFER,
+// TOKEN_SAVINGS_ESTIMATED, COLLAB_TASK_COMPLETED, COLLAB_TASK_BLOCKED,
+// COLLAB_PHASE_STARTED) and the v1 events kept alive alongside them
+// (WORK_ORDER_CREATED, ROUND_COMPLETED, REVIEW_DECISION,
+// LOCAL_ASSIST_REQUESTED, COLLAB_FALLBACK_REQUESTED). Unknown phases and
+// missing fields never throw — a marker must never break the stream.
+const COLLAB_MARKER_EVENTS = new Set([
+  'COLLAB_TASK_STARTED',
+  'COLLAB_EXPLORATION',
+  'COLLAB_REPORT',
+  'COLLAB_PLAN_REVIEW',
+  'COLLAB_DISPATCH',
+  'COLLAB_REVIEW_DECISION',
+  'COLLAB_STABLE_AUTO_OFFER',
+  'TOKEN_SAVINGS_ESTIMATED',
+  'COLLAB_TASK_COMPLETED',
+  'COLLAB_TASK_BLOCKED',
+  'COLLAB_PHASE_STARTED',
+  'WORK_ORDER_CREATED',
+  'ROUND_COMPLETED',
+  'REVIEW_DECISION',
+  'LOCAL_ASSIST_REQUESTED',
+  'COLLAB_FALLBACK_REQUESTED',
+]);
+
+// Human labels for the v2 phase machine (unknown phases render verbatim).
+const COLLAB_PHASE_LABELS = {
+  EXPLORING: '探索(本地, 只读)',
+  REPORT_DRAFTING: '报告起草',
+  REPORT_REVIEW: '报告审批',
+  PRE_PLANNING: '预规划',
+  PRE_PLAN_REVIEW: '计划审批',
+  IMPLEMENTING: '实施',
+  CORRECTION_ROUND: '修复轮',
+  REVIEWING: '审查',
+  AWAITING_AUTO_FALLBACK: '等待降级确认',
+};
+
+// "省 ≈Z%" from the shared token-savings payload shape
+// (high_input_tokens + estimated_tokens_avoided = the估算 baseline).
+function collabSavedPercent(data) {
+  const avoided = Number(data.estimated_tokens_avoided) || 0;
+  const high = Number(data.high_input_tokens) || 0;
+  const baseline = high + avoided;
+  if (!(baseline > 0) || !(avoided > 0)) return '';
+  return '省 ≈' + Math.round((avoided / baseline) * 100) + '%';
+}
+
+function collabMarkerText(type, data) {
+  if (!data || typeof data !== 'object') return '';
+  try {
+    const head = '⬢ ';
+    const phase = String(data.phase || '');
+    const reason = data.reason ? truncate(String(data.reason).replace(/\s+/gu, ' '), 300) : '';
+
+    if (type === 'COLLAB_TASK_STARTED') {
+      if (String(data.version || '') === 'v2') {
+        const stage = phase === 'EXPLORING' || !phase
+          ? '探索阶段(本地, 只读)'
+          : (COLLAB_PHASE_LABELS[phase] || truncate(phase, 40)) + '阶段';
+        return head + 'DragonAI Collab v2 · 任务启动 · ' + stage;
+      }
+      return head + 'DragonAI Collab · 任务启动 (' + truncate(String(data.mode || 'auto-collab'), 40) + ')';
+    }
+
+    if (type === 'COLLAB_EXPLORATION') {
+      const leg = Number.isFinite(Number(data.leg)) ? Number(data.leg) : 0;
+      const legText = leg > 0 ? ' · leg ' + leg : '';
+      const step = Number.isFinite(Number(data.step)) && Number(data.step) > 0
+        ? ' · step ' + Number(data.step)
+        : '';
+      const tool = data.tool ? ' · ' + truncate(String(data.tool), 60) : '';
+      const preview = data.preview
+        ? ' · ' + truncate(String(data.preview).replace(/\s+/gu, ' '), 300)
+        : '';
+      if (phase === 'leg_started') {
+        const task = data.task_preview
+          ? ' · ' + truncate(String(data.task_preview).replace(/\s+/gu, ' '), 200)
+          : '';
+        return head + '探索' + legText + ' 开始' + (data.resumed ? ' (续)' : '') + task;
+      }
+      if (phase === 'tool_call') return head + '探索' + legText + step + tool + preview;
+      if (phase === 'observation') {
+        const merged = Number(data.merged_count) > 1 ? ' ×' + Number(data.merged_count) : '';
+        return head + '探索' + legText + step + tool + ' ⇢ ' +
+          (data.is_error ? '✗ ' : '') + 'observation' + merged + preview;
+      }
+      if (phase === 'steered') {
+        const message = truncate(String(data.message_preview || '').replace(/\s+/gu, ' '), 200);
+        return head + '探索转向' + (data.auto ? ' (auto)' : '') + ' · "' + message + '"';
+      }
+      if (phase === 'leg_done') {
+        const failed = data.status && data.status !== 'finished';
+        const steps = Number.isFinite(Number(data.steps)) ? ' · ' + Number(data.steps) + ' steps' : '';
+        return head + '探索' + legText + (failed
+          ? ' ✗ ' + truncate(String(data.status), 40)
+          : ' 完成') + steps + preview;
+      }
+      if (phase === 'done') {
+        if (String(data.status || '') === 'paused') {
+          return head + '探索暂停' + (reason ? ' · ' + reason : '');
+        }
+        const parts = [head + '探索完成'];
+        if (Number(data.legs)) parts.push(Number(data.legs) + ' legs');
+        if (Number.isFinite(Number(data.facts))) parts.push(Number(data.facts) + ' facts');
+        if (Number.isFinite(Number(data.files))) parts.push(Number(data.files) + ' files');
+        if (Number(data.risks)) parts.push(Number(data.risks) + ' risks');
+        if (Number.isFinite(Number(data.open_questions))) {
+          parts.push(Number(data.open_questions) + ' questions');
+        }
+        return parts.join(' · ');
+      }
+      return phase ? head + '探索 · ' + truncate(phase, 40) : '';
+    }
+
+    if (type === 'COLLAB_REPORT') {
+      if (phase && phase !== 'ready') return '';
+      const lines = [];
+      if (typeof data.rendered === 'string' && data.rendered.trim()) {
+        lines.push(data.rendered.trim());
+        lines.push('');
+      }
+      const revision = Number.isFinite(Number(data.revision))
+        ? ' (revision ' + Number(data.revision) + ')'
+        : '';
+      lines.push(
+        head + '升级报告待审' + revision +
+        ' · 回复 **yes** 采用 / **no: <意见>** 修改'
+      );
+      return lines.join('\n');
+    }
+
+    if (type === 'COLLAB_PLAN_REVIEW') {
+      const steps = Number.isFinite(Number(data.steps)) && Number(data.steps) > 0
+        ? ' · ' + Number(data.steps) + ' steps'
+        : '';
+      const round = Number.isFinite(Number(data.review_round)) && Number(data.review_round) > 0
+        ? '（第 ' + Number(data.review_round) + '/2 轮）'
+        : '';
+      return head + '计划待审批' + steps +
+        ' · 回复 **yes** 开始实施 / **no: <原因>** 重新规划' + round;
+    }
+
+    if (type === 'COLLAB_DISPATCH') {
+      const route = String(data.route || '');
+      const llm = data.subagent_llm ? ' (模型: ' + truncate(String(data.subagent_llm), 60) + ')' : '';
+      const target = route === 'subagent'
+        ? 'OpenHands subagent' + llm
+        : route === 'proxied-toolcall'
+          ? '高智能 lane (proxied toolcall)'
+          : route === 'codex-native'
+            ? 'Codex native (本地 worker)'
+            : truncate(route || 'unknown route', 40);
+      const stepNumber = Number(data.step_number);
+      const total = Number(data.total_steps);
+      const position = Number.isFinite(stepNumber) && stepNumber > 0
+        ? ' · step ' + stepNumber + (Number.isFinite(total) && total > 0 ? '/' + total : '')
+        : '';
+      const why = data.reason
+        ? '\nwhy: ' + truncate(String(data.reason).replace(/\s+/gu, ' '), 500)
+        : '';
+      return head + '派发' + position + ' → ' + target + why;
+    }
+
+    if (type === 'COLLAB_REVIEW_DECISION' || type === 'REVIEW_DECISION') {
+      const action = truncate(String(data.action || 'UNKNOWN'), 40);
+      const parts = [head + '审查 · ' + action];
+      if (type === 'COLLAB_REVIEW_DECISION' && data.final) parts.push('最终审查');
+      if (action === 'REVISE' && type === 'COLLAB_REVIEW_DECISION') {
+        const applied = Number(data.corrections_applied) || 0;
+        parts.push('修复轮（剩 ' + Math.max(0, 1 - applied) + ' 次）');
+      }
+      if (data.summary) {
+        parts.push(truncate(String(data.summary).replace(/\s+/gu, ' '), 300));
+      }
+      return parts.join(' · ');
+    }
+
+    if (type === 'TOKEN_SAVINGS_ESTIMATED') {
+      const high = Number(data.high_input_tokens) || 0;
+      const avoided = Number(data.estimated_tokens_avoided) || 0;
+      const saved = collabSavedPercent(data);
+      return head + 'Token 节省(估算) · high 输入 ' + high +
+        ' · 基线 ' + (high + avoided) + (saved ? ' · ' + saved : ' · 省 ≈0%');
+    }
+
+    if (type === 'COLLAB_STABLE_AUTO_OFFER') {
+      return head + 'Copilot 不可用' + (reason ? ' (' + reason + ')' : '') +
+        ' · 回复 **yes** 转稳定 /route auto / **no** 取消';
+    }
+
+    if (type === 'COLLAB_TASK_COMPLETED') {
+      const parts = [head + '✔ 协作任务完成', '审查通过'];
+      if (Number(data.high_calls) || Number(data.local_calls)) {
+        parts.push('high ' + (Number(data.high_calls) || 0) +
+          ' · local ' + (Number(data.local_calls) || 0));
+      }
+      const saved = collabSavedPercent(data);
+      if (saved) parts.push(saved + ' (estimated)');
+      return parts.join(' · ');
+    }
+
+    if (type === 'COLLAB_TASK_BLOCKED') {
+      const review = data.review && typeof data.review === 'object' ? data.review : {};
+      const why = reason ||
+        (review.summary ? truncate(String(review.summary).replace(/\s+/gu, ' '), 300) : '') ||
+        (phase ? 'phase ' + truncate(phase, 40) : '未知原因');
+      return head + '✗ 协作任务受阻 · ' + why;
+    }
+
+    if (type === 'COLLAB_PHASE_STARTED') {
+      if (!phase) return '';
+      const label = COLLAB_PHASE_LABELS[phase];
+      const lead = data.lead ? ' · lead=' + truncate(String(data.lead), 60) : '';
+      return head + '阶段 · ' + (label ? label + ' (' + truncate(phase, 40) + ')' : truncate(phase, 60)) + lead;
+    }
+
+    if (type === 'WORK_ORDER_CREATED') {
+      const checks = Array.isArray(data.completion_checks) ? data.completion_checks.length : 0;
+      return head + '工单已创建 · ' +
+        truncate(String(data.objective || 'work order').replace(/\s+/gu, ' '), 200) +
+        (data.risk ? ' · risk=' + truncate(String(data.risk), 20) : '') +
+        (checks ? ' · ' + checks + ' checks' : '');
+    }
+
+    if (type === 'ROUND_COMPLETED') {
+      const parts = [head + '轮次完成'];
+      if (phase) parts.push(truncate(phase, 40));
+      if (Array.isArray(data.completed_steps) && data.completed_steps.length) {
+        parts.push(data.completed_steps.length + ' steps');
+      }
+      if (Array.isArray(data.verified_facts) && data.verified_facts.length) {
+        parts.push(data.verified_facts.length + ' facts');
+      }
+      if (Array.isArray(data.remaining_gaps) && data.remaining_gaps.length) {
+        parts.push(data.remaining_gaps.length + ' gaps');
+      }
+      return parts.join(' · ');
+    }
+
+    if (type === 'LOCAL_ASSIST_REQUESTED') {
+      return head + '本地佐证请求' + (phase ? ' · ' + truncate(phase, 40) : '') +
+        (data.request ? ' · ' + truncate(String(data.request).replace(/\s+/gu, ' '), 300) : '');
+    }
+
+    if (type === 'COLLAB_FALLBACK_REQUESTED') {
+      const preserved = Array.isArray(data.preserved_artifacts)
+        ? data.preserved_artifacts.length
+        : 0;
+      return head + '协作降级 · ' + (reason || '原因未知') +
+        (preserved ? ' · 保留 ' + preserved + ' 个 artifact' : '');
+    }
+
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+// One completed proxied-LLM call (PROXIED_LLM_USED): purpose, model and
+// token spend plus the approval authority, e.g.
+// "⇑ Proxied LLM · collab-review · copilot-claude5 · 3.2k tokens (approved: report-gate)".
+function proxiedUsedText(data) {
+  if (!data || typeof data !== 'object') return '';
+  try {
+    const parts = ['⇑ Proxied LLM'];
+    if (data.purpose) parts.push(truncate(String(data.purpose), 60));
+    const model = data.model || data.lane;
+    if (model) parts.push(truncate(String(model), 80));
+    const tokens = (Number(data.prompt_tokens) || 0) +
+      (Number(data.completion_tokens) || 0);
+    const tokenText = tokens >= 1000
+      ? (Math.round(tokens / 100) / 10) + 'k tokens'
+      : tokens + ' tokens';
+    parts.push(tokenText);
+    let text = parts.join(' · ');
+    if (data.approved_by) {
+      text += ' (approved: ' + truncate(String(data.approved_by), 40) + ')';
+    }
+    return text;
+  } catch {
+    return '';
+  }
+}
+
+function contractErrorText(data) {
+  if (!data || typeof data !== 'object') return '';
+  try {
+    const tool = data.tool || data.name || 'unknown_tool';
+    const lines = ['✗ Codex tool contract · ' + truncate(tool, 200)];
+    if (data.error_code) lines.push('code: ' + truncate(data.error_code, 120));
+    if (data.codex_error) lines.push('Codex says: ' + truncate(data.codex_error, 700));
+    if (Array.isArray(data.argument_names) && data.argument_names.length) {
+      lines.push('args: ' + truncate(data.argument_names.join(', '), 400));
+    }
+    if (Array.isArray(data.repairs) && data.repairs.length) {
+      lines.push('repairs: ' + truncate(data.repairs.join('; '), 600));
+    }
+    return lines.join('\n');
+  } catch {
+    return '';
+  }
+}
+
 function toolResultMarkerText(data) {
   if (!data || typeof data !== 'object' || !data.tool) return '';
   if (data.status !== 'completed' && data.status !== 'failed') return '';
@@ -509,7 +1075,9 @@ function toolDecisionMarkerText(data) {
   const source = String(data.tool).startsWith('mcp__') ? 'MCP' : 'Tool';
   const owner = data.decision === 'execute_local'
     ? 'DragonAI read-only runtime'
-    : 'Codex approval/sandbox';
+    : data.decision === 'execute_subagent'
+      ? 'OpenHands subagent'
+      : 'Codex approval/sandbox';
   return '◇ ' + source + ' call · ' + data.tool + ' → ' + owner;
 }
 
@@ -673,11 +1241,43 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     } else if (type === 'TOOL_REQUEST') {
       emitToolRequest(data);
     } else if (type === 'PLAN_UPDATE') {
-      try { emitTextMarker(planMarkerText(data)); } catch {}
+      try {
+        const parts = [planMarkerText(data)];
+        if (data && typeof data === 'object') {
+          if (data.planner && typeof data.planner === 'object' &&
+              Array.isArray(data.planner.attempts) &&
+              data.planner.attempts.length) {
+            parts.push(plannerLadderText(data.planner));
+          }
+          if (data.phase === 'rejected' && data.blocked_reason) {
+            parts.push('✗ plan blocked: ' + truncate(String(data.blocked_reason), 500));
+          }
+          if (data.plan && typeof data.plan === 'object') {
+            parts.push(planTableText(data.plan));
+          }
+        }
+        emitTextMarker(parts.filter(Boolean).join('\n'));
+      } catch {}
+    } else if (type === 'PLAN_STEP_UPDATE') {
+      try { emitTextMarker(stepUpdateText(data)); } catch {}
+    } else if (type === 'MEMORY_RECALL') {
+      try { emitTextMarker(memoryRecallText(data)); } catch {}
     } else if (type === 'TOOL_RESULT') {
       try { emitTextMarker(toolResultMarkerText(data)); } catch {}
     } else if (type === 'TOOL_DECISION') {
       try { emitTextMarker(toolDecisionMarkerText(data)); } catch {}
+    } else if (type === 'TOOL_CONTRACT_ERROR') {
+      try { emitTextMarker(contractErrorText(data)); } catch {}
+    } else if (type === 'SUBAGENT_EXECUTION' || type === 'FALLBACK_EXECUTION') {
+      // S-P2 event name (old FALLBACK_EXECUTION kept for one-release compat).
+      try { emitTextMarker(subagentMarkerText(data)); } catch {}
+    } else if (COLLAB_MARKER_EVENTS.has(type)) {
+      // Collab v1 + v2 events (P7) -> the ⬢ collab marker; empty renders
+      // are skipped and a bad payload never breaks the stream.
+      try { emitTextMarker(collabMarkerText(type, data)); } catch {}
+    } else if (type === 'PROXIED_LLM_USED') {
+      // Proxied-LLM usage log: every remote call renders a visible chip.
+      try { emitTextMarker(proxiedUsedText(data)); } catch {}
     } else if (type === 'EVIDENCE_SUMMARY') {
       try { emitTextMarker(evidenceMarkerText(data)); } catch {}
     } else if (type === 'MODEL_RESULT') {
@@ -763,12 +1363,13 @@ function respondJsonResult(res, envelope, body, translateOutputItem) {
 // Handle one POST /responses turn through the Brain. Never throws; on any
 // failure it answers 502 JSON (before the SSE starts) or response.failed
 // (after), so the client never hangs.
-async function runBrainTurn({ req, res, body, isStream, translateOutputItem, log } = {}) {
+async function runBrainTurn({ req, res, body, isStream, toolRegistry, translateOutputItem, log } = {}) {
   const logFn = typeof log === 'function' ? log : () => {};
   try {
     const envelope = buildModelRequest(body || {}, {
       stream: Boolean(isStream),
       headers: req && req.headers ? req.headers : {},
+      toolRegistry,
     });
     const headers = { 'content-type': 'application/json' };
     if (brainApiKey()) headers.authorization = 'Bearer ' + brainApiKey();
@@ -845,4 +1446,14 @@ module.exports = {
   buildModelRequest,
   runBrainTurn,
   modelsProxy,
+  // Pure marker renderers (unit-tested in test/dragonai-brain-markers.test.js).
+  planTableText,
+  plannerLadderText,
+  memoryRecallText,
+  stepUpdateText,
+  contractErrorText,
+  subagentMarkerText,
+  collabMarkerText,
+  toolDecisionMarkerText,
+  proxiedUsedText,
 };
