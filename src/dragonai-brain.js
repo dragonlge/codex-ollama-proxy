@@ -53,6 +53,23 @@ function genId(prefix) {
   return prefix + '_' + crypto.randomBytes(12).toString('hex');
 }
 
+// SSE keepalive interval towards Codex. Codex's Responses reader arms its
+// idle timer around `stream.next()` on a parsed SSE *event*
+// (codex-rs/codex-api/src/sse/responses.rs `timeout(idle_timeout,
+// stream.next())`), so comment lines (`: ping`) never reset it. While the
+// Brain thinks (a local worker inference can stay silent for minutes) we must
+// emit a real event or Codex fails the turn with "idle timeout waiting for
+// SSE". 0 disables the heartbeat.
+const SSE_HEARTBEAT_DEFAULT_MS = 15000;
+
+function sseHeartbeatMs(env = process.env) {
+  const raw = env.DRAGONAI_SSE_HEARTBEAT_MS;
+  if (raw === undefined || String(raw).trim() === '') return SSE_HEARTBEAT_DEFAULT_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return SSE_HEARTBEAT_DEFAULT_MS;
+  return Math.floor(value);
+}
+
 // Plain text of a Responses message content value (string or part array).
 function contentText(content) {
   if (content == null) return '';
@@ -873,6 +890,18 @@ function collabMarkerText(type, data) {
     }
 
     if (type === 'COLLAB_REPORT') {
+      if (phase === 'completed' || data.report_kind === 'task-completion') {
+        const lines = [];
+        if (typeof data.rendered === 'string' && data.rendered.trim()) {
+          lines.push(data.rendered.trim());
+          lines.push('');
+        }
+        const ref = data.report_ref
+          ? ' · artifact ' + truncate(String(data.report_ref), 80)
+          : '';
+        lines.push(head + '任务报告已生成 · 无需审批' + ref);
+        return lines.join('\n');
+      }
       if (phase && phase !== 'ready') return '';
       const lines = [];
       if (typeof data.rendered === 'string' && data.rendered.trim()) {
@@ -1042,6 +1071,17 @@ function proxiedUsedText(data) {
   }
 }
 
+function consultMarkerText(data) {
+  if (!data || typeof data !== 'object') return '';
+  if (String(data.kind || '') !== 'solution') return '';
+  const marker = String(data.ui_marker || 'escalated to Perplexity (web)');
+  const reason = data.reason
+    ? '\nwhy: ' + truncate(String(data.reason), 500)
+    : '';
+  const state = data.ok === false ? ' · failed' : ' · advisory ready';
+  return '⇑ ' + marker + state + reason;
+}
+
 function contractErrorText(data) {
   if (!data || typeof data !== 'object') return '';
   try {
@@ -1106,36 +1146,66 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     'cache-control': 'no-cache',
     connection: 'keep-alive',
   });
-  const inProgress = { id: responseId, object: 'response', created_at: createdAt, status: 'in_progress', model, output: [], output_text: '' };
-  markers.writeSseEvent(res, 'response.created', { type: 'response.created', sequence_number: seq.num++, response: inProgress });
-  markers.writeSseEvent(res, 'response.in_progress', { type: 'response.in_progress', sequence_number: seq.num++, response: inProgress });
-  const heartbeatMs = Math.max(1000, Number(process.env.DRAGONAI_SSE_HEARTBEAT_MS) || 15000);
-  const heartbeat = setInterval(() => {
-    if (!terminal && !res.writableEnded) {
-      try {
-        // A real Responses event also resets clients whose idle detector only
-        // counts parsed SSE events (rather than raw comment bytes).
-        markers.writeSseEvent(res, 'response.in_progress', {
-          type: 'response.in_progress',
-          sequence_number: seq.num++,
-          response: { ...inProgress, status: 'in_progress' },
-        });
-      } catch {}
+  // Silence-gated heartbeat towards Codex: whenever no SSE *event* has been
+  // written for `heartbeatMs`, emit a no-op `response.dragonai.heartbeat`
+  // event. Codex parses it and drops it in its harmless catch-all branch
+  // (`_ => trace!("unhandled responses event")` in codex-rs
+  // codex-api/src/sse/responses.rs), but arriving at all resets its
+  // `stream_idle_timeout_ms` timer. Real events reset the silence clock, so a
+  // steadily streaming turn never emits heartbeats.
+  const heartbeatMs = sseHeartbeatMs();
+  const hb = { lastEventAt: Date.now(), sent: 0, timer: null };
+
+  function writeEvent(event, obj) {
+    hb.lastEventAt = Date.now();
+    markers.writeSseEvent(res, event, obj);
+  }
+
+  function writeItem(item) {
+    hb.lastEventAt = Date.now();
+    markers.emitOutputItem(res, item, seq);
+  }
+
+  function stopHeartbeat() {
+    if (hb.timer) {
+      clearInterval(hb.timer);
+      hb.timer = null;
+      if (hb.sent > 0) log('brain: sse heartbeats emitted this turn: ' + hb.sent);
     }
-  }, heartbeatMs);
-  if (typeof heartbeat.unref === 'function') heartbeat.unref();
+  }
+
+  const inProgress = { id: responseId, object: 'response', created_at: createdAt, status: 'in_progress', model, output: [], output_text: '' };
+  writeEvent('response.created', { type: 'response.created', sequence_number: seq.num++, response: inProgress });
+  writeEvent('response.in_progress', { type: 'response.in_progress', sequence_number: seq.num++, response: inProgress });
+  if (heartbeatMs > 0) {
+    // Tick faster than the interval so the worst-case silent gap stays close
+    // to `heartbeatMs` (never `2 * heartbeatMs`).
+    hb.timer = setInterval(() => {
+      if (terminal || res.writableEnded) return;
+      if (Date.now() - hb.lastEventAt < heartbeatMs) return;
+      try {
+        writeEvent('response.dragonai.heartbeat', {
+          type: 'response.dragonai.heartbeat',
+          sequence_number: seq.num++,
+        });
+        hb.sent += 1;
+        log('brain: sse heartbeat #' + hb.sent + ' (silence > ' + heartbeatMs + 'ms)');
+      } catch {}
+    }, Math.max(25, Math.min(heartbeatMs, 5000)));
+    if (typeof hb.timer.unref === 'function') hb.timer.unref();
+  }
 
   function startMessage() {
     if (msg.started) return;
     msg.started = true;
     msg.index = seq.index++;
-    markers.writeSseEvent(res, 'response.output_item.added', {
+    writeEvent('response.output_item.added', {
       type: 'response.output_item.added',
       output_index: msg.index,
       sequence_number: seq.num++,
       item: { id: msg.id, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
     });
-    markers.writeSseEvent(res, 'response.content_part.added', {
+    writeEvent('response.content_part.added', {
       type: 'response.content_part.added',
       item_id: msg.id,
       output_index: msg.index,
@@ -1149,7 +1219,7 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     if (!text) return;
     startMessage();
     msg.text += text;
-    markers.writeSseEvent(res, 'response.output_text.delta', {
+    writeEvent('response.output_text.delta', {
       type: 'response.output_text.delta',
       item_id: msg.id,
       output_index: msg.index,
@@ -1163,13 +1233,13 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     if (!msg.started || msg.done) return;
     msg.done = true;
     const item = messageItem(msg.id, msg.text);
-    markers.writeSseEvent(res, 'response.output_text.done', {
+    writeEvent('response.output_text.done', {
       type: 'response.output_text.done', item_id: msg.id, output_index: msg.index, content_index: 0, sequence_number: seq.num++, text: msg.text,
     });
-    markers.writeSseEvent(res, 'response.content_part.done', {
+    writeEvent('response.content_part.done', {
       type: 'response.content_part.done', item_id: msg.id, output_index: msg.index, content_index: 0, sequence_number: seq.num++, part: item.content[0],
     });
-    markers.writeSseEvent(res, 'response.output_item.done', {
+    writeEvent('response.output_item.done', {
       type: 'response.output_item.done', output_index: msg.index, sequence_number: seq.num++, item,
     });
     output.push(item);
@@ -1181,7 +1251,7 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     if (callId && emittedCallIds.has(callId)) return;
     if (callId) emittedCallIds.add(callId);
     const item = applyTranslate(functionCallItem(data), translateOutputItem);
-    markers.emitOutputItem(res, item, seq);
+    writeItem(item);
     output.push(item);
   }
 
@@ -1190,14 +1260,14 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
   function emitTextMarker(text) {
     if (!text) return;
     const item = messageItem(genId('msg'), text);
-    markers.emitOutputItem(res, item, seq);
+    writeItem(item);
     output.push(item);
   }
 
   function emitFailed(message) {
     terminal = true;
-    clearInterval(heartbeat);
-    markers.writeSseEvent(res, 'response.failed', {
+    stopHeartbeat();
+    writeEvent('response.failed', {
       type: 'response.failed',
       sequence_number: seq.num++,
       response: { id: responseId, object: 'response', created_at: createdAt, status: 'failed', model, output: output.slice(), error: { message } },
@@ -1217,8 +1287,8 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     const toolRequests = data && Array.isArray(data.tool_requests) ? data.tool_requests : [];
     for (const t of toolRequests) emitToolRequest(t);
     terminal = true;
-    clearInterval(heartbeat);
-    markers.writeSseEvent(res, 'response.completed', {
+    stopHeartbeat();
+    writeEvent('response.completed', {
       type: 'response.completed',
       sequence_number: seq.num++,
       response: {
@@ -1278,6 +1348,10 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     } else if (type === 'PROXIED_LLM_USED') {
       // Proxied-LLM usage log: every remote call renders a visible chip.
       try { emitTextMarker(proxiedUsedText(data)); } catch {}
+    } else if (type === 'CONSULT') {
+      // Whole-solution Perplexity escalation remains advisory; the next
+      // local/Codex round still owns every tool call.
+      try { emitTextMarker(consultMarkerText(data)); } catch {}
     } else if (type === 'EVIDENCE_SUMMARY') {
       try { emitTextMarker(evidenceMarkerText(data)); } catch {}
     } else if (type === 'MODEL_RESULT') {
@@ -1310,13 +1384,13 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
     }
     buffer += decoder.end();
   } catch (e) {
-    clearInterval(heartbeat);
+    stopHeartbeat();
     log('brain: stream error: ' + e.message);
     if (!terminal) emitFailed('dragonai brain stream error: ' + e.message);
     return;
   }
   if (!terminal) {
-    clearInterval(heartbeat);
+    stopHeartbeat();
     log('brain: stream ended without MODEL_RESULT');
     emitFailed('dragonai brain stream ended without MODEL_RESULT');
   }

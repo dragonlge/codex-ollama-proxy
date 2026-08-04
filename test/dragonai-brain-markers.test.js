@@ -242,6 +242,23 @@ test('collabMarkerText renders the collab v2 lifecycle markers', () => {
     ].join('\n')
   );
   assert.equal(
+    brain.collabMarkerText('COLLAB_REPORT', {
+      version: 'v2',
+      phase: 'completed',
+      report_kind: 'task-completion',
+      approval_required: false,
+      report_ref: 'artifact:task-report:1',
+      rendered: '# DragonAI 任务完成报告\n\n- tests passed',
+    }),
+    [
+      '# DragonAI 任务完成报告',
+      '',
+      '- tests passed',
+      '',
+      '⬢ 任务报告已生成 · 无需审批 · artifact artifact:task-report:1',
+    ].join('\n')
+  );
+  assert.equal(
     brain.collabMarkerText('COLLAB_DISPATCH', {
       version: 'v2',
       step_number: 3,

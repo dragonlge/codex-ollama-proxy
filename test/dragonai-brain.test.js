@@ -384,3 +384,93 @@ test('brain mode translates a streamed dragonai-agent/v1 turn into a Codex Respo
     fs.rmSync(codexHome, { recursive: true, force: true });
   }
 });
+
+test('brain mode emits silence-gated SSE heartbeats that codex ignores, resets on real events, and stops at stream end', async () => {
+  // Brain stays silent for ~400ms (simulating a slow local worker inference),
+  // then streams one delta and finishes 80ms later. With a 150ms heartbeat
+  // interval we must see heartbeats during the silence, none between the
+  // delta and the result (the real event resets the clock), and none after
+  // the stream ends (the timer is cleared).
+  const brainServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    // Flush headers right away (the real Brain opens its SSE body promptly);
+    // a bare comment must NOT count as a Codex-visible event.
+    res.write(': ready\n\n');
+    setTimeout(() => {
+      writeSse(res, 'MODEL_DELTA', { text: 'slow answer' });
+      setTimeout(() => {
+        writeSse(res, 'MODEL_RESULT', {
+          status: 'completed',
+          text: 'slow answer',
+          usage: { input_tokens: 1, output_tokens: 2 },
+        });
+        res.end();
+      }, 80);
+    }, 400);
+  });
+  const brainPort = await listen(brainServer);
+
+  const previousEnv = {
+    DRAGONAI_BRAIN_URL: process.env.DRAGONAI_BRAIN_URL,
+    DRAGONAI_BRAIN_API_KEY: process.env.DRAGONAI_BRAIN_API_KEY,
+    DRAGONAI_SSE_HEARTBEAT_MS: process.env.DRAGONAI_SSE_HEARTBEAT_MS,
+  };
+  process.env.DRAGONAI_BRAIN_URL = 'http://127.0.0.1:' + brainPort;
+  delete process.env.DRAGONAI_BRAIN_API_KEY;
+  process.env.DRAGONAI_SSE_HEARTBEAT_MS = '150';
+
+  const res = {
+    headersSent: false,
+    writableEnded: false,
+    chunks: [],
+    writeHead() { this.headersSent = true; },
+    write(chunk) { this.chunks.push(String(chunk)); return true; },
+    end() { this.writableEnded = true; },
+  };
+  const logs = [];
+  try {
+    await brain.runBrainTurn({
+      req: { headers: {} },
+      res,
+      body: {
+        model: 'dragonai/auto',
+        stream: true,
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'slow question' }] }],
+      },
+      isStream: true,
+      log: (line) => logs.push(line),
+    });
+
+    assert.equal(res.writableEnded, true);
+    const isHeartbeat = (chunk) => chunk.includes('event: response.dragonai.heartbeat');
+    const heartbeats = res.chunks.filter(isHeartbeat);
+    assert.ok(heartbeats.length >= 1, 'expected at least one heartbeat during brain silence');
+    const parsed = parseSse(heartbeats[0]);
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0].event, 'response.dragonai.heartbeat');
+    assert.equal(parsed[0].data.type, 'response.dragonai.heartbeat');
+    assert.equal(typeof parsed[0].data.sequence_number, 'number');
+
+    // A real event resets the silence clock: the delta-to-result gap (80ms)
+    // stays under the 150ms interval, so no heartbeat may follow the delta.
+    const deltaIndex = res.chunks.findIndex((chunk) => chunk.includes('response.output_text.delta'));
+    assert.ok(deltaIndex > -1, 'expected the streamed delta to reach the client');
+    assert.ok(
+      res.chunks.slice(deltaIndex).every((chunk) => !isHeartbeat(chunk)),
+      'heartbeat fired although a real event had just reset the timer'
+    );
+    assert.ok(res.chunks[res.chunks.length - 1].includes('response.completed'));
+
+    // The timer is cleared at stream end: no writes trickle in afterwards.
+    const settled = res.chunks.length;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(res.chunks.length, settled, 'heartbeat timer kept running after the stream ended');
+    assert.ok(logs.some((line) => line.includes('sse heartbeat #1')), 'expected a debug log per heartbeat');
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await close(brainServer);
+  }
+});
