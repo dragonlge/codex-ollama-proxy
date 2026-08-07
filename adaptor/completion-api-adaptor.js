@@ -114,16 +114,26 @@ function contentForChat(role, content) {
 }
 
 function responsesInputToChatMessages(body) {
-  const messages = [];
-  if (body.instructions) messages.push({ role: 'system', content: String(body.instructions) });
+  // Many local model chat templates (e.g. qwen3.6-35b) require all system
+  // messages to appear before any user/assistant messages. We collect system
+  // content separately and emit it first, then append the remaining messages
+  // in their original order.
+  const systemParts = [];
+  if (body.instructions) systemParts.push(String(body.instructions));
 
   const input = body.input;
-  if (typeof input === 'string') return messages.concat({ role: 'user', content: input });
+  if (typeof input === 'string') {
+    if (systemParts.length) return [{ role: 'system', content: systemParts.join('\n\n') }, { role: 'user', content: input }];
+    return [{ role: 'user', content: input }];
+  }
   if (!Array.isArray(input)) {
     const prompt = body.message || body.prompt;
-    return prompt ? messages.concat({ role: 'user', content: String(prompt) }) : messages;
+    if (!prompt) return systemParts.length ? [{ role: 'system', content: systemParts.join('\n\n') }] : [{ role: 'user', content: '' }];
+    if (systemParts.length) return [{ role: 'system', content: systemParts.join('\n\n') }, { role: 'user', content: String(prompt) }];
+    return [{ role: 'user', content: String(prompt) }];
   }
 
+  const messages = [];
   let pendingToolCalls = [];
   for (const item of input) {
     if (!item || typeof item !== 'object') continue;
@@ -146,13 +156,19 @@ function responsesInputToChatMessages(body) {
 
     const role = item.role || (item.type === 'message' ? 'user' : null);
     if (role === 'system' || role === 'developer') {
-      messages.push({ role: 'system', content: contentText(item.content) });
+      // Hoist system content to the front to satisfy chat templates that
+      // require system messages before any other role.
+      systemParts.push(contentText(item.content));
     } else if (role === 'user' || role === 'assistant') {
       messages.push({ role, content: contentForChat(role, item.content) });
     }
   }
   if (pendingToolCalls.length) messages.push({ role: 'assistant', content: '', tool_calls: pendingToolCalls });
-  return messages.length ? messages : [{ role: 'user', content: '' }];
+
+  const out = [];
+  if (systemParts.length) out.push({ role: 'system', content: systemParts.join('\n\n') });
+  if (messages.length) out.push(...messages);
+  return out.length ? out : [{ role: 'user', content: '' }];
 }
 
 function responsesToolsToChatTools(tools) {
@@ -299,13 +315,25 @@ function completionToResponse(completion, model) {
   const choice = completion.choices && completion.choices[0];
   const msg = choice && choice.message ? choice.message : {};
   const text = msg.content || '';
+  const reasoning = msg.reasoning_content || '';
   const output = [];
+  if (reasoning) {
+    output.push({
+      id: id('rs'),
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: reasoning }],
+    });
+  }
   for (const call of msg.tool_calls || []) output.push(toolItem(call));
   for (const image of msg.images || []) {
     const item = imageItem(image);
     if (item) output.push(item);
   }
   if (text || output.length === 0) output.push(messageItem(text));
+  if (reasoning) {
+    const preview = reasoning.replace(/\n/g, ' ').slice(0, 80);
+    debugLog('reasoning: non-streaming (' + reasoning.length + ' chars) preview: ' + preview);
+  }
   return {
     id: id('resp'),
     object: 'response',
@@ -369,6 +397,10 @@ async function streamResponse(res, body, options) {
   let textStarted = false;
   let textOutputIndex = null;
   let text = '';
+  let reasoningStarted = false;
+  let reasoningId = id('rs');
+  let reasoningOutputIndex = null;
+  let reasoningText = '';
   const toolStates = new Map();
   const imageStates = new Map();
   const output = [];
@@ -452,6 +484,32 @@ async function streamResponse(res, body, options) {
         }
       }
 
+      if (delta.reasoning_content) {
+        // LM Studio / Qwen returns reasoning_content in streaming deltas.
+        // Emit it as response.reasoning_summary_text.delta so codex core
+        // maps it to ReasoningContentDeltaEvent → TUI shows "Thinking" status.
+        if (!reasoningStarted) {
+          reasoningStarted = true;
+          reasoningOutputIndex = outputIndex++;
+          sse(res, 'response.output_item.added', {
+            type: 'response.output_item.added',
+            output_index: reasoningOutputIndex,
+            sequence_number: sequence++,
+            item: { id: reasoningId, type: 'reasoning', summary: [] },
+          });
+          debugLog('reasoning: streaming started (model=' + (body.model || '?') + ')');
+        }
+        reasoningText += delta.reasoning_content;
+        sse(res, 'response.reasoning_summary_text.delta', {
+          type: 'response.reasoning_summary_text.delta',
+          item_id: reasoningId,
+          output_index: reasoningOutputIndex,
+          summary_index: 0,
+          sequence_number: sequence++,
+          delta: delta.reasoning_content,
+        });
+      }
+
       if (delta.content) {
         if (!textStarted) {
           textStarted = true;
@@ -514,6 +572,32 @@ async function streamResponse(res, body, options) {
     sse(res, 'response.content_part.done', { type: 'response.content_part.done', item_id: msgId, output_index: textOutputIndex, content_index: 0, sequence_number: sequence++, part: item.content[0] });
     sse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: textOutputIndex, sequence_number: sequence++, item });
     output.push(item);
+  }
+
+  if (reasoningStarted) {
+    const reasoningItem = {
+      id: reasoningId,
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: reasoningText }],
+    };
+    sse(res, 'response.reasoning_summary_text.done', {
+      type: 'response.reasoning_summary_text.done',
+      item_id: reasoningId,
+      output_index: reasoningOutputIndex,
+      summary_index: 0,
+      sequence_number: sequence++,
+      text: reasoningText,
+    });
+    sse(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: reasoningOutputIndex,
+      sequence_number: sequence++,
+      item: reasoningItem,
+    });
+    output.push(reasoningItem);
+    // Short log for verification (first 80 chars, single line)
+    const preview = reasoningText.replace(/\n/g, ' ').slice(0, 80);
+    debugLog('reasoning: done (' + reasoningText.length + ' chars) preview: ' + preview);
   }
 
   sse(res, 'response.completed', {

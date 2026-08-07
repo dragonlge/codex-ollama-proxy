@@ -224,7 +224,7 @@ test('collabMarkerText renders the collab v2 lifecycle markers', () => {
       phase: 'EXPLORING',
       experimental: true,
     }),
-    '⬢ DragonAI Collab v2 · 任务启动 · 探索阶段(本地, 只读)'
+    '⬢ [collab:phase] DragonAI Collab v2 · 任务启动 · 勘察阶段(本地, 只读)'
   );
   assert.equal(
     brain.collabMarkerText('COLLAB_REPORT', {

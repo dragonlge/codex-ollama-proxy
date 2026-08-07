@@ -801,7 +801,7 @@ const COLLAB_MARKER_EVENTS = new Set([
 
 // Human labels for the v2 phase machine (unknown phases render verbatim).
 const COLLAB_PHASE_LABELS = {
-  EXPLORING: '探索(本地, 只读)',
+  EXPLORING: '勘察',
   REPORT_DRAFTING: '报告起草',
   REPORT_REVIEW: '报告审批',
   PRE_PLANNING: '预规划',
@@ -822,6 +822,89 @@ function collabSavedPercent(data) {
   return '省 ≈' + Math.round((avoided / baseline) * 100) + '%';
 }
 
+// COLLAB_RUNTIME_STATUS -> compact status chip with [collab:status] tag.
+// Emitted every ~5s by the main agent's polling loop. The TUI sidebar
+// parses the tag to update the spinner, progress bar, and ETA display.
+//   ⬢ [collab:status] 勘察 · 轮次 1 · step 3/12 · 45s/2m0s
+function runtimeStatusText(data) {
+  if (!data || typeof data !== 'object') return '';
+  try {
+    // Supervisor decision marker — show 🧠 brain icon with the decision
+    const supervisorAction = String(data.supervisor_action || data.supervisor_decision || '');
+    if (supervisorAction) {
+      const reason = data.supervisor_reason || data.reason || '';
+      const icon = supervisorAction === 'STEER' ? '🧠→' : supervisorAction === 'EXTEND' ? '🧠+' : supervisorAction === 'FINISH' ? '🧠✓' : supervisorAction === 'CANCEL' ? '🧠✗' : '🧠';
+      const parts = ['⬢ [collab:status] ' + icon + ' Supervisor ' + supervisorAction];
+      if (reason) parts.push(truncate(String(reason).replace(/\s+/gu, ' '), 120));
+      return parts.join(' · ');
+    }
+
+    const round = Number.isFinite(Number(data.round)) ? Number(data.round) : 0;
+    const step = Number.isFinite(Number(data.step)) ? Number(data.step) : 0;
+    const maxSteps = Number.isFinite(Number(data.max_steps)) ? Number(data.max_steps) : 0;
+    const elapsed = Number.isFinite(Number(data.elapsed_s)) ? Number(data.elapsed_s) : 0;
+    const estTotal = Number.isFinite(Number(data.estimated_total_s)) ? Number(data.estimated_total_s) : 0;
+    const phase = String(data.current_phase || '');
+    const parts = ['⬢ [collab:status] 勘察'];
+    if (round > 0) parts.push('轮次 ' + round);
+    if (maxSteps > 0) parts.push('step ' + step + '/' + maxSteps);
+    else if (step > 0) parts.push('step ' + step);
+    if (elapsed > 0 || estTotal > 0) {
+      parts.push(formatDuration(elapsed) + '/' + formatDuration(estTotal));
+    }
+    // Show thinking phase with brain icon
+    if (phase === 'diagnosing') parts.push('🧠 思考中');
+    return parts.join(' · ');
+  } catch {
+    return '';
+  }
+}
+
+// COLLAB_PHASE_TRANSITION -> phase change marker with [collab:phase] tag.
+//   ⬢ [collab:phase] 阶段转换 · 勘察 → 报告起草 · 用时 2m15s
+function phaseTransitionText(data) {
+  if (!data || typeof data !== 'object') return '';
+  try {
+    const from = String(data.from_phase || '');
+    const to = String(data.to_phase || '');
+    const duration = Number.isFinite(Number(data.duration_s)) ? Number(data.duration_s) : 0;
+    const fromLabel = COLLAB_PHASE_LABELS[from] || from || '?';
+    const toLabel = COLLAB_PHASE_LABELS[to] || to || '?';
+    return '⬢ [collab:phase] 阶段转换 · ' + fromLabel + ' → ' + toLabel +
+      (duration > 0 ? ' · 用时 ' + formatDuration(duration) : '');
+  } catch {
+    return '';
+  }
+}
+
+// PLAN_PROGRESS -> plan step progress with [collab:plan] tag.
+//   ⬢ [collab:plan] 计划 · step 3/12 · 42% · ETA 1m30s
+function planProgressText(data) {
+  if (!data || typeof data !== 'object') return '';
+  try {
+    const stepN = Number.isFinite(Number(data.step_n)) ? Number(data.step_n) : 0;
+    const total = Number.isFinite(Number(data.total_steps)) ? Number(data.total_steps) : 0;
+    const remaining = Number.isFinite(Number(data.estimated_remaining_s)) ? Number(data.estimated_remaining_s) : 0;
+    if (total <= 0) return '';
+    const pct = Math.round((stepN / total) * 100);
+    const parts = ['⬢ [collab:plan] 计划', 'step ' + stepN + '/' + total, pct + '%'];
+    if (remaining > 0) parts.push('ETA ' + formatDuration(remaining));
+    return parts.join(' · ');
+  } catch {
+    return '';
+  }
+}
+
+// Format seconds as "Xm Ys" or "Xs" for compact display.
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0s';
+  const s = Math.round(seconds);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return m + 'm' + (rem > 0 ? rem + 's' : '');
+}
+
 function collabMarkerText(type, data) {
   if (!data || typeof data !== 'object') return '';
   try {
@@ -832,16 +915,16 @@ function collabMarkerText(type, data) {
     if (type === 'COLLAB_TASK_STARTED') {
       if (String(data.version || '') === 'v2') {
         const stage = phase === 'EXPLORING' || !phase
-          ? '探索阶段(本地, 只读)'
+          ? '勘察阶段(本地, 只读)'
           : (COLLAB_PHASE_LABELS[phase] || truncate(phase, 40)) + '阶段';
-        return head + 'DragonAI Collab v2 · 任务启动 · ' + stage;
+        return head + '[collab:phase] DragonAI Collab v2 · 任务启动 · ' + stage;
       }
       return head + 'DragonAI Collab · 任务启动 (' + truncate(String(data.mode || 'auto-collab'), 40) + ')';
     }
 
     if (type === 'COLLAB_EXPLORATION') {
       const leg = Number.isFinite(Number(data.leg)) ? Number(data.leg) : 0;
-      const legText = leg > 0 ? ' · leg ' + leg : '';
+      const legText = leg > 0 ? ' · 轮次 ' + leg : '';
       const step = Number.isFinite(Number(data.step)) && Number(data.step) > 0
         ? ' · step ' + Number(data.step)
         : '';
@@ -853,31 +936,37 @@ function collabMarkerText(type, data) {
         const task = data.task_preview
           ? ' · ' + truncate(String(data.task_preview).replace(/\s+/gu, ' '), 200)
           : '';
-        return head + '探索' + legText + ' 开始' + (data.resumed ? ' (续)' : '') + task;
+        return head + '[collab:status] 勘察' + legText + ' 开始' + (data.resumed ? ' (续)' : '') + task;
       }
-      if (phase === 'tool_call') return head + '探索' + legText + step + tool + preview;
+      if (phase === 'tool_call') {
+        // Show 🧠 brain icon for think tool calls to indicate reasoning
+        if (String(data.tool || '') === 'think') {
+          return head + '[collab:status] 🧠 思考' + legText + step + ' · ' + truncate(String(data.preview || '').replace(/\s+/gu, ' '), 200);
+        }
+        return head + '[collab:status] 勘察' + legText + step + tool + preview;
+      }
       if (phase === 'observation') {
         const merged = Number(data.merged_count) > 1 ? ' ×' + Number(data.merged_count) : '';
-        return head + '探索' + legText + step + tool + ' ⇢ ' +
+        return head + '[collab:status] 勘察' + legText + step + tool + ' ⇢ ' +
           (data.is_error ? '✗ ' : '') + 'observation' + merged + preview;
       }
       if (phase === 'steered') {
         const message = truncate(String(data.message_preview || '').replace(/\s+/gu, ' '), 200);
-        return head + '探索转向' + (data.auto ? ' (auto)' : '') + ' · "' + message + '"';
+        return head + '[collab:status] 勘察转向' + (data.auto ? ' (auto)' : '') + ' · "' + message + '"';
       }
       if (phase === 'leg_done') {
         const failed = data.status && data.status !== 'finished';
         const steps = Number.isFinite(Number(data.steps)) ? ' · ' + Number(data.steps) + ' steps' : '';
-        return head + '探索' + legText + (failed
+        return head + '[collab:status] 勘察' + legText + (failed
           ? ' ✗ ' + truncate(String(data.status), 40)
           : ' 完成') + steps + preview;
       }
       if (phase === 'done') {
         if (String(data.status || '') === 'paused') {
-          return head + '探索暂停' + (reason ? ' · ' + reason : '');
+          return head + '[collab:status] 勘察暂停' + (reason ? ' · ' + reason : '');
         }
-        const parts = [head + '探索完成'];
-        if (Number(data.legs)) parts.push(Number(data.legs) + ' legs');
+        const parts = [head + '[collab:status] 勘察完成'];
+        if (Number(data.legs)) parts.push(Number(data.legs) + ' 轮次');
         if (Number.isFinite(Number(data.facts))) parts.push(Number(data.facts) + ' facts');
         if (Number.isFinite(Number(data.files))) parts.push(Number(data.files) + ' files');
         if (Number(data.risks)) parts.push(Number(data.risks) + ' risks');
@@ -886,7 +975,7 @@ function collabMarkerText(type, data) {
         }
         return parts.join(' · ');
       }
-      return phase ? head + '探索 · ' + truncate(phase, 40) : '';
+      return phase ? head + '[collab:status] 勘察 · ' + truncate(phase, 40) : '';
     }
 
     if (type === 'COLLAB_REPORT') {
@@ -1354,6 +1443,12 @@ async function streamTurn(res, upstreamBody, body, translateOutputItem, log) {
       try { emitTextMarker(consultMarkerText(data)); } catch {}
     } else if (type === 'EVIDENCE_SUMMARY') {
       try { emitTextMarker(evidenceMarkerText(data)); } catch {}
+    } else if (type === 'COLLAB_RUNTIME_STATUS') {
+      try { emitTextMarker(runtimeStatusText(data)); } catch {}
+    } else if (type === 'COLLAB_PHASE_TRANSITION') {
+      try { emitTextMarker(phaseTransitionText(data)); } catch {}
+    } else if (type === 'PLAN_PROGRESS') {
+      try { emitTextMarker(planProgressText(data)); } catch {}
     } else if (type === 'MODEL_RESULT') {
       handleResult(data);
     }
@@ -1528,6 +1623,10 @@ module.exports = {
   contractErrorText,
   subagentMarkerText,
   collabMarkerText,
+  runtimeStatusText,
+  phaseTransitionText,
+  planProgressText,
+  formatDuration,
   toolDecisionMarkerText,
   proxiedUsedText,
 };
